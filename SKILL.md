@@ -1,11 +1,7 @@
 ---
 name: ascend-doc-auto-updater
-description: >
-Detect and fetch the latest “Ascend C算子开发” PDF from the Huawei Ascend CANN Community Edition
-documentation download page for a user-specified version, then convert the PDF into chapter-level
-Markdown files and save them under ascend_dev_guide_sections/.
-metadata:
-  short-description: Auto-download AscendC operator dev PDF and export TOC-split Markdown.
+description: Detect and fetch the latest “Ascend C算子开发” PDF from the Huawei Ascend CANN Community Edition documentation, download page for a user-specified version, then convert the PDF into chapter-level markdown files and save them under ascend_dev_guide_sections/.
+metadata: Auto-download AscendC operator dev PDF and export TOC-split Markdown.
 
 ---
 
