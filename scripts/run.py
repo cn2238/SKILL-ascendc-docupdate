@@ -43,6 +43,35 @@ TABLE_TITLE_START_RE = re.compile(r"^表\d+-\d+\s+\S")
 TABLE_TITLE_INLINE_RE = re.compile(r"表\d+-\d+\s+\S")
 CMAKE_VAR_HEAD_RE = re.compile(r"^(CMAKE_[A-Z0-9_]+)\s+(.*)$")
 LIB_HEAD_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_.+-]*)\s+(.*)$")
+API_TABLE_ROW_START_RE = re.compile(r"^(?:基础API|Utils API|高阶API)\s*>")
+API_TABLE_HEADER_NOISE_RE = re.compile(r"接口分类接口名称(?:备注)?")
+API_NAME_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)?")
+API_CLASS_TAIL_WORDS = [
+    "基础算术",
+    "逻辑计算",
+    "复合计算",
+    "比较与选择",
+    "类型转换",
+    "归约计算",
+    "数据转换",
+    "数据填充",
+    "排序组合",
+    "离散与聚合",
+    "掩码操作",
+    "量化设置",
+    "基础数据搬运",
+    "增强数据搬运",
+    "切片数据搬运",
+    "核内同步",
+    "核间同步",
+    "缓存控制",
+    "系统变量访问",
+    "系统变量访 问",
+    "算法",
+    "容器函数",
+    "类型特性",
+    "type_traits",
+]
 CMAKE_CONTINUATION_WORDS = {
     "PROPERTIES",
     "LANGUAGE",
@@ -435,6 +464,8 @@ def is_code_like(line: str, prev_is_code: bool) -> bool:
         return True
     if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*\(.*\)\s*(//.*)?$", t):
         return True
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_:<>\s*&]+\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^;]+;\s*(//.*)?$", t):
+        return True
     if not has_cjk and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*\(.*$", t):
         return True
     if has_cjk and ";" in t and re.search(r"[A-Za-z_][A-Za-z0-9_:.>]*\s*\(", t):
@@ -446,6 +477,8 @@ def is_code_like(line: str, prev_is_code: bool) -> bool:
     if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)", t) and re.search(r"[=<>]", t) and not has_cjk:
         return True
     if prev_is_code and looks_like_code_continuation_line(t):
+        return True
+    if prev_is_code and looks_like_mixed_token_cjk_continuation(t):
         return True
     if prev_is_code and CODE_FILE_RE.search(t):
         return True
@@ -509,6 +542,25 @@ def looks_like_cpp_signature_line(line: str) -> bool:
             break
 
     return qualifier_or_type or len(tokens) >= 3
+
+
+def looks_like_mixed_token_cjk_continuation(line: str) -> bool:
+    t = squeeze_ws(line)
+    if not t:
+        return False
+    if normalize_list_item(t) is not None:
+        return False
+    if t.startswith(("●", "-", "步骤", "表", "图")):
+        return False
+    if not re.match(r"^[A-Za-z0-9_]+[\u4e00-\u9fff]", t):
+        return False
+    if re.search(r"[{};#]", t):
+        return False
+    if re.search(r"[A-Za-z_][A-Za-z0-9_]*\s*\(", t):
+        return False
+    if len(t) > 100:
+        return False
+    return True
 
 
 def normalize_heading_text(line: str) -> str:
@@ -586,6 +638,34 @@ def should_attach_hash_comment_continuation(line: str, last_code_line: str) -> b
     if len(curr) > 120:
         return False
     return bool(re.search(r"[\u4e00-\u9fff]", curr))
+
+
+def should_attach_inline_comment_continuation(line: str, last_code_line: str) -> bool:
+    curr = squeeze_ws(line)
+    prev = last_code_line.strip()
+    if "//" not in prev:
+        return False
+    if prev.startswith("//"):
+        return False
+    comment_part = prev.split("//", 1)[1].strip()
+    if comment_part.endswith(("。", ".", "！", "!", "？", "?", "；", ";")):
+        return False
+    if not curr or normalize_list_item(curr) is not None:
+        return False
+    if curr.startswith(("●", "-", "步骤", "表", "图")):
+        return False
+    if not (
+        re.match(r"^[\u4e00-\u9fff]", curr)
+        or looks_like_mixed_token_cjk_continuation(curr)
+    ):
+        return False
+    if re.search(r"[{};#]", curr):
+        return False
+    if re.search(r"[A-Za-z_][A-Za-z0-9_]*\s*\(", curr):
+        return False
+    if len(curr) > 80:
+        return False
+    return True
 
 
 def normalize_code_lines(lines: list[str]) -> list[str]:
@@ -689,6 +769,18 @@ def postprocess_common_table_blocks(lines: list[str]) -> list[str]:
             continue
 
         head = line.strip()
+        if head == "### 接口分类 接口名称":
+            block, nxt = parse_api_scope_table_block(lines, i, with_remark=False)
+            if block:
+                out.extend(block)
+                i = nxt
+                continue
+        if head == "### 接口分类 接口名称 备注":
+            block, nxt = parse_api_scope_table_block(lines, i, with_remark=True)
+            if block:
+                out.extend(block)
+                i = nxt
+                continue
         if head == "### 变量 配置说明":
             block, nxt = parse_var_table_block(lines, i)
             if block:
@@ -869,6 +961,393 @@ def parse_lib_table_2col_block(lines: list[str], start: int) -> tuple[list[str] 
     return table_lines, k
 
 
+def clean_api_table_text(text: str) -> str:
+    t = squeeze_ws(text)
+    if not t:
+        return t
+    t = API_TABLE_HEADER_NOISE_RE.sub("", t)
+    t = t.replace("接口分类 接口名称 备注", "")
+    t = t.replace("接口分类 接口名称", "")
+    t = t.replace("系统变量访 问", "系统变量访问")
+    return squeeze_ws(t)
+
+
+def looks_like_api_table_row_start(text: str) -> bool:
+    return bool(API_TABLE_ROW_START_RE.match(squeeze_ws(text)))
+
+
+def add_api_class_tail(api_class: str, tail: str) -> str:
+    c = squeeze_ws(api_class)
+    t = squeeze_ws(tail)
+    if not t or t in c:
+        return c
+    if t in {"算法", "容器函数", "类型特性", "type_traits"} and not c.endswith(">"):
+        if c.endswith(("C++标准库", "模板库函数")):
+            return f"{c} > {t}".strip()
+    return f"{c} {t}".strip()
+
+
+def join_api_name_parts(left: str, right: str) -> str:
+    l = squeeze_ws(left)
+    r = squeeze_ws(right)
+    if not l:
+        return r
+    if not r:
+        return l
+    if l.endswith(("、", "，", ",", "/", "(", "（")):
+        return f"{l}{r}"
+    return join_prose(l, r)
+
+
+def split_api_class_and_name(text: str) -> tuple[str | None, str | None]:
+    t = clean_api_table_text(text)
+    if not t:
+        return None, None
+    for m in API_NAME_TOKEN_RE.finditer(t):
+        token = m.group(0)
+        prefix = t[: m.start()].strip()
+        if prefix.count(">") < 1:
+            continue
+        if not re.search(r"[\u4e00-\u9fff]", prefix):
+            continue
+        if token in {"API", "Utils", "Atlas", "Core"}:
+            continue
+        return squeeze_ws(prefix), squeeze_ws(t[m.start() :])
+    return None, None
+
+
+def extract_api_class_tail_prefix(text: str) -> tuple[str, str]:
+    t = squeeze_ws(text)
+    for w in sorted(API_CLASS_TAIL_WORDS, key=len, reverse=True):
+        if t.startswith(w):
+            return w, squeeze_ws(t[len(w) :])
+    return "", t
+
+
+def looks_like_api_remark_text(text: str) -> bool:
+    t = squeeze_ws(text)
+    if not t:
+        return False
+    if t.startswith(">") or "不支持" in t or "TSCM" in t:
+        return True
+    if re.search(r"[A-Za-z_]", t):
+        return False
+    return bool(re.search(r"[\u4e00-\u9fff]", t))
+
+
+def should_arrow_be_class_tail(api_class: str, right: str) -> bool:
+    cls = squeeze_ws(api_class)
+    r = squeeze_ws(right)
+    if not r:
+        return False
+    tail, _ = extract_api_class_tail_prefix(r)
+    if not tail:
+        return False
+    if "不支持" in r or "TSCM" in r:
+        return False
+    if cls.startswith(("Utils API >", "高阶API >")):
+        return True
+    return bool(API_NAME_TOKEN_RE.search(r))
+
+
+def repair_api_class_and_name(api_class: str, api_name: str) -> tuple[str, str]:
+    cls = clean_api_table_text(api_class)
+    name = clean_api_table_text(api_name).lstrip("-").strip()
+    cls = cls.replace("基础API > 数据搬运增强数据搬运", "基础API > 数据搬运 > 增强数据搬运")
+
+    if cls.endswith("访") and name.startswith("问"):
+        cls = f"{cls}问"
+        name = name[1:].lstrip()
+    cls = cls.replace("系统变量访", "系统变量访问")
+    if "系统变量访问" in cls:
+        name = re.sub(r"^问\s+", "", name)
+        name = re.sub(r"([、,，])\s*问\s+", r"\1", name)
+
+    for w in sorted(API_CLASS_TAIL_WORDS, key=len, reverse=True):
+        p = re.compile(rf"([、,，])\s*{re.escape(w)}\s+")
+        if p.search(name):
+            name = p.sub(r"\1", name, count=1)
+            cls = add_api_class_tail(cls, w)
+        if name.startswith(f"{w} "):
+            name = squeeze_ws(name[len(w) :])
+            cls = add_api_class_tail(cls, w)
+        if name.endswith(w) and re.search(r"[A-Za-z0-9_)\]）]$", name[: -len(w)]):
+            name = name[: -len(w)].rstrip(" 、,，")
+            cls = add_api_class_tail(cls, w)
+        m = re.match(rf"^([A-Za-z_][A-Za-z0-9_:/()<>+-]*){re.escape(w)}$", name)
+        if m:
+            name = m.group(1)
+            cls = add_api_class_tail(cls, w)
+
+    name = squeeze_ws(name)
+    name = re.sub(r"\s+([，。；：！？、）】》])", r"\1", name)
+    name = re.sub(r"([（【《])\s+", r"\1", name)
+    if (cls == "高阶API >" or cls == "高阶API") and name.startswith("C++标准库 "):
+        cls = "高阶API > C++标准库"
+        name = squeeze_ws(name[len("C++标准库 ") :])
+    if cls == "高阶API > 类型特性" and name.startswith("C++标准库 "):
+        cls = "高阶API > C++标准库 > 类型特性"
+        name = squeeze_ws(name[len("C++标准库 ") :])
+    if cls == "高阶API > 模板库函数 type_traits":
+        cls = "高阶API > 模板库函数 > type_traits"
+    if cls == "基础API >" and (
+        name.startswith("Copy、DataCopyPad")
+        or name.startswith("DataCopy")
+        or name.startswith("VECIN/")
+    ):
+        cls = "基础API > 数据搬运"
+    if cls.endswith(">") and name == "SetDeqScale":
+        cls = add_api_class_tail(cls, "量化设置")
+    elif cls.endswith(">"):
+        cls = cls.rstrip(">").rstrip()
+    return cls, name
+
+
+def parse_api_scope_row(line: str, with_remark: bool) -> list[str] | None:
+    t = clean_api_table_text(line)
+    api_class, rest = split_api_class_and_name(t)
+    if not api_class or not rest:
+        return None
+
+    api_name = rest
+    remark = "-" if with_remark else ""
+
+    if with_remark:
+        if "不支持" in api_class:
+            before, rem = api_class.split("不支持", 1)
+            api_class = squeeze_ws(before)
+            remark = f"不支持{squeeze_ws(rem)}" if squeeze_ws(rem) else "不支持"
+
+        arrow = re.search(r"\s*->\s*", rest)
+        if arrow:
+            api_name = squeeze_ws(rest[: arrow.start()])
+            right = clean_api_table_text(rest[arrow.end() :])
+            if right:
+                if should_arrow_be_class_tail(api_class, right):
+                    tail, tail_rest = extract_api_class_tail_prefix(right)
+                    api_class = add_api_class_tail(api_class, tail)
+                    if tail_rest:
+                        api_name = join_api_name_parts(api_name, tail_rest)
+                    remark = "-"
+                else:
+                    remark = right
+        else:
+            m = re.search(r"\s+-(?!>)\s*", rest)
+            if m:
+                left = squeeze_ws(rest[: m.start()])
+                right = clean_api_table_text(rest[m.end() :])
+                api_name = left
+                if not right:
+                    remark = "-"
+                else:
+                    tail, tail_rest = extract_api_class_tail_prefix(right)
+                    if tail:
+                        api_class = add_api_class_tail(api_class, tail)
+                        if tail_rest:
+                            api_name = join_api_name_parts(api_name, tail_rest)
+                        remark = "-"
+                    elif looks_like_api_remark_text(right):
+                        remark = right
+                    else:
+                        api_name = join_api_name_parts(api_name, right)
+                        remark = "-"
+
+    api_class, api_name = repair_api_class_and_name(api_class, api_name)
+    if not api_class or not api_name:
+        return None
+    if with_remark:
+        return [api_class, api_name, clean_api_table_text(remark) or "-"]
+    return [api_class, api_name]
+
+
+def parse_api_scope_table_block(
+    lines: list[str], start: int, with_remark: bool
+) -> tuple[list[str] | None, int]:
+    j = start + 1
+    while j < len(lines) and lines[j].strip() == "":
+        j += 1
+
+    rows: list[list[str]] = []
+    pending_tail = ""
+    trailing_table_title = ""
+    k = j
+    while k < len(lines):
+        stop_after_current = False
+        cur = lines[k]
+        t = cur.strip()
+        if cur.startswith("```"):
+            break
+        if cur.startswith("## "):
+            break
+        if TABLE_TITLE_START_RE.match(t):
+            break
+        if cur.startswith("### "):
+            heading_text = clean_api_table_text(cur[4:].strip().rstrip("-").strip())
+            if not heading_text:
+                k += 1
+                continue
+            if heading_text in API_CLASS_TAIL_WORDS:
+                pending_tail = heading_text
+                k += 1
+                continue
+            if heading_text.startswith("接口分类"):
+                k += 1
+                continue
+            break
+        if not t:
+            k += 1
+            continue
+
+        t = clean_api_table_text(t)
+        if not t:
+            k += 1
+            continue
+        m_title = TABLE_TITLE_INLINE_RE.search(t)
+        if m_title and m_title.start() > 0:
+            trailing_table_title = squeeze_ws(t[m_title.start() :])
+            t = squeeze_ws(t[: m_title.start()])
+            stop_after_current = True
+            if not t:
+                break
+
+        if looks_like_api_table_row_start(t):
+            row = parse_api_scope_row(t, with_remark)
+            if row:
+                if pending_tail:
+                    if row[0].endswith(">"):
+                        row[0] = add_api_class_tail(row[0], pending_tail)
+                    pending_tail = ""
+                rows.append(row)
+            k += 1
+            if stop_after_current:
+                break
+            continue
+
+        if with_remark and rows and re.match(
+            r"^(基础数据搬运|增强数据搬运|随路转换ND2NZ搬运|随路转换NZ2ND搬运|随路量化激活搬运|Copy、DataCopyPad、)",
+            t,
+        ):
+            base = rows[-1][0]
+            m = re.match(r"^(.*>)\s*", base)
+            base_prefix = m.group(1) if m else base
+            synthetic = f"{base_prefix} {t}"
+            row = parse_api_scope_row(synthetic, with_remark)
+            if row:
+                if pending_tail:
+                    if row[0].endswith(">"):
+                        row[0] = add_api_class_tail(row[0], pending_tail)
+                    pending_tail = ""
+                rows.append(row)
+            k += 1
+            if stop_after_current:
+                break
+            continue
+
+        if not rows:
+            k += 1
+            if stop_after_current:
+                break
+            continue
+
+        if with_remark and (t.startswith("- >") or t.startswith("-")):
+            extra = squeeze_ws(t.lstrip("-").lstrip(">"))
+            if extra:
+                rows[-1][2] = append_desc_cell(rows[-1][2], extra)
+            k += 1
+            if stop_after_current:
+                break
+            continue
+
+        if with_remark and looks_like_api_remark_text(t):
+            rows[-1][2] = append_desc_cell(rows[-1][2], t.lstrip("> ").strip())
+        else:
+            rows[-1][1] = append_desc_cell(rows[-1][1], t)
+        k += 1
+        if stop_after_current:
+            break
+
+    if len(rows) < 2:
+        return None, start + 1
+
+    if with_remark:
+        rows = normalize_api_scope_special_rows(rows)
+
+    if with_remark:
+        table_lines = [
+            "### 接口分类 接口名称 备注",
+            "",
+            "| 接口分类 | 接口名称 | 备注 |",
+            "| --- | --- | --- |",
+        ]
+        for api_class, api_name, remark in rows:
+            table_lines.append(
+                f"| {escape_table_cell(api_class)} | {escape_table_cell(api_name)} | {escape_table_cell(remark)} |"
+            )
+    else:
+        table_lines = [
+            "### 接口分类 接口名称",
+            "",
+            "| 接口分类 | 接口名称 |",
+            "| --- | --- |",
+        ]
+        for api_class, api_name in rows:
+            table_lines.append(
+                f"| {escape_table_cell(api_class)} | {escape_table_cell(api_name)} |"
+            )
+    table_lines.append("")
+    if trailing_table_title:
+        table_lines.append(trailing_table_title)
+        table_lines.append("")
+    return table_lines, k
+
+
+def normalize_api_scope_special_rows(rows: list[list[str]]) -> list[list[str]]:
+    out: list[list[str]] = []
+    inserted_slice_row = False
+
+    for cls, name, remark in rows:
+        cls = squeeze_ws(cls)
+        name = squeeze_ws(name)
+        remark = squeeze_ws(remark).replace("> TSCM", "-> TSCM")
+
+        m_move = re.fullmatch(r"基础API > 数据搬运 > (基础数据搬运|增强数据搬运)", cls)
+        if m_move and "VECIN/" in name:
+            out.append(
+                [
+                    "基础API > 数据搬运 > DataCopy",
+                    m_move.group(1),
+                    "不支持VECIN/VECCALC/VECOUT<br>-> TSCM通路的数据搬运。",
+                ]
+            )
+            continue
+
+        if cls == "基础API > 数据搬运 > 随路转换":
+            if not inserted_slice_row:
+                out.append(["基础API > 数据搬运 > DataCopy", "切片数据搬运", "-"])
+                inserted_slice_row = True
+            out.append(
+                [
+                    "基础API > 数据搬运 > DataCopy",
+                    "随路转换ND2NZ搬运<br>随路转换NZ2ND搬运<br>随路量化激活搬运",
+                    "不支持VECIN/VECCALC/VECOUT<br>-> TSCM通路的数据搬运。",
+                ]
+            )
+            continue
+
+        if cls == "基础API > 数据搬运 >" and (
+            name.startswith("Copy、DataCopyPad")
+            or name.startswith("DataCopy")
+            or name.startswith("VECIN/")
+        ):
+            cls = "基础API > 数据搬运"
+
+        out.append([cls, name, remark])
+        if cls.startswith("基础API > 数据搬运") and name == "切片数据搬运":
+            inserted_slice_row = True
+
+    return out
+
+
 def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
     _, heading_title = split_sec_no(cur_title)
     title_norms = {
@@ -974,6 +1453,7 @@ def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
         if code_buf and (
             should_attach_code_comment_continuation(stripped, code_buf[-1])
             or should_attach_hash_comment_continuation(stripped, code_buf[-1])
+            or should_attach_inline_comment_continuation(stripped, code_buf[-1])
         ):
             code_buf.append(raw)
             prev_raw_blank = False
