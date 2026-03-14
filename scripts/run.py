@@ -25,11 +25,15 @@ ORDERED_RE = re.compile(r"^([0-9]+)[\.\)、)]\s*(.+)$")
 LETTER_RE = re.compile(r"^([a-zA-Z])[\.\)]\s*(.+)$")
 BULLET_RE = re.compile(r"^[\-\*\+•●▪◦–—]+\s*(.+)$")
 CODE_HEAD_RE = re.compile(
-    r"^(#\s*include|#\s*define|#\s*if|#\s*endif|extern\b|template\b|typedef\b|using\b|class\b|struct\b|enum\b|namespace\b|if\s*\(|for\s*\(|while\s*\(|switch\s*\(|return\b|auto\b|const\b|static\b|void\b)"
+    r"^(#\s*include|#\s*define|#\s*if|#\s*endif|extern\b|template\b|typedef\b|using\b|class\b|struct\b|enum\b|namespace\b|if\s*\(|for\s*\(|while\s*\(|switch\s*\(|return\b|auto\b|const\b|static\b|void\b|inline\b|constexpr\b|public\s*:|private\s*:|protected\s*:|__global__\b|__aicore__\b|__aicpu__\b)"
 )
 SHELL_RE = re.compile(r"^(?:\$|cmake\b|python3?\b|bash\b|sh\b|make\b|pip\b|export\b|source\b|msopgen\b)")
 FIGURE_RE = re.compile(r"^(图|表)\s*\d")
 CJK_SPACE_RE = re.compile(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])")
+CPP_QUALIFIER_RE = re.compile(r"^(?:extern|inline|static|constexpr|virtual|friend|__global__|__aicore__|__aicpu__)$")
+CPP_TYPE_HINT_RE = re.compile(
+    r"^(?:void|bool|char|short|int|long|float|double|size_t|int\d+_t|uint\d+_t|acl\w*|AscendC::\w*|Kernel\w*)$"
+)
 
 
 def load_state():
@@ -255,9 +259,15 @@ def is_code_like(line: str, prev_is_code: bool) -> bool:
     if FIGURE_RE.match(t):
         return False
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", t))
+    if t.startswith("${") and has_cjk:
+        return False
     if CODE_HEAD_RE.search(t) or SHELL_RE.search(t):
         return True
     if t.startswith("//") or t.startswith("/*") or t.endswith("*/"):
+        return True
+    if re.fullmatch(r"(public|private|protected)\s*:", t):
+        return True
+    if looks_like_cpp_signature_line(t):
         return True
     if re.match(r"^[A-Za-z_][A-Za-z0-9_:<>]*\s*\(.*\)\s*;?\s*(//.*)?$", t):
         return True
@@ -271,9 +281,40 @@ def is_code_like(line: str, prev_is_code: bool) -> bool:
         return True
     if prev_is_code and re.fullmatch(r"[.·…]{3,}", t):
         return True
-    if prev_is_code and re.search(r"[(){}\[\];,<>#=]", t):
+    if prev_is_code and (not has_cjk) and re.search(r"[(){}\[\];,<>#=]", t):
         return True
     return False
+
+
+def looks_like_cpp_signature_line(line: str) -> bool:
+    t = squeeze_ws(line)
+    if not t:
+        return False
+    if normalize_list_item(t) is not None:
+        return False
+    if re.search(r"[\u4e00-\u9fff]", t):
+        return False
+    if "(" not in t or ")" not in t:
+        return False
+
+    prefix = t.split("(", 1)[0].strip()
+    if not prefix:
+        return False
+
+    raw_tokens = [tok for tok in re.split(r"\s+", prefix) if tok]
+    tokens = [tok.strip("*&") for tok in raw_tokens if tok.strip("*&")]
+    if len(tokens) < 2:
+        return False
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tokens[-1]):
+        return False
+
+    qualifier_or_type = False
+    for tok in tokens[:-1]:
+        if CPP_QUALIFIER_RE.match(tok) or CPP_TYPE_HINT_RE.match(tok):
+            qualifier_or_type = True
+            break
+
+    return qualifier_or_type or len(tokens) >= 3
 
 
 def normalize_heading_text(line: str) -> str:
@@ -359,6 +400,7 @@ def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
     para_buf: list[tuple[str, int]] = []
     code_buf: list[str] = []
     prev_raw_blank = True
+    pending_blank_after_code = False
 
     def append_blank():
         if blocks and blocks[-1] != "":
@@ -414,11 +456,21 @@ def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
         indent = len(raw) - len(raw.lstrip(" "))
 
         if not stripped:
+            if code_buf:
+                pending_blank_after_code = True
+                prev_raw_blank = True
+                continue
             flush_para()
-            flush_code()
             append_blank()
             prev_raw_blank = True
             continue
+
+        if pending_blank_after_code:
+            if is_code_like(raw, prev_is_code=True):
+                code_buf.append("")
+            else:
+                flush_code()
+            pending_blank_after_code = False
 
         if norm_for_match(stripped) in title_norms:
             prev_raw_blank = False
