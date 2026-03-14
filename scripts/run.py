@@ -27,13 +27,33 @@ BULLET_RE = re.compile(r"^[\-\*\+•●▪◦–—]+\s*(.+)$")
 CODE_HEAD_RE = re.compile(
     r"^(#\s*include|#\s*define|#\s*if|#\s*endif|extern\b|template\b|typedef\b|using\b|class\b|struct\b|enum\b|namespace\b|if\s*\(|for\s*\(|while\s*\(|switch\s*\(|return\b|auto\b|const\b|static\b|void\b|inline\b|constexpr\b|public\s*:|private\s*:|protected\s*:|__global__\b|__aicore__\b|__aicpu__\b)"
 )
-SHELL_RE = re.compile(r"^(?:\$|cmake\b|python3?\b|bash\b|sh\b|make\b|pip\b|export\b|source\b|msopgen\b)")
+SHELL_RE = re.compile(r"^(?:\$|cmake\b|python3?\b|bash\b|sh\b|make\b|pip\b|export\b|source\b|msopgen\b|bisheng(?:\s|-))")
 FIGURE_RE = re.compile(r"^(图|表)\s*\d")
 CJK_SPACE_RE = re.compile(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])")
 CPP_QUALIFIER_RE = re.compile(r"^(?:extern|inline|static|constexpr|virtual|friend|__global__|__aicore__|__aicpu__)$")
 CPP_TYPE_HINT_RE = re.compile(
     r"^(?:void|bool|char|short|int|long|float|double|size_t|int\d+_t|uint\d+_t|acl\w*|AscendC::\w*|Kernel\w*)$"
 )
+CODE_FILE_RE = re.compile(r"(?:[A-Za-z0-9_./${}-]+)?\.(?:c|cc|cpp|cxx|h|hpp|asc|aicpu|o|so|a)(?![A-Za-z0-9_])")
+CLI_OPTION_RE = re.compile(r"(?:^|\s)--?[A-Za-z][A-Za-z0-9_-]*")
+CLI_FLAG_LINE_RE = re.compile(r"^--?[A-Za-z][A-Za-z0-9_]*(?:[=:\-][A-Za-z0-9_./${}-]+)?$")
+CODE_WORD_SEQ_RE = re.compile(r"^[A-Za-z0-9_./${}<>\-+=:]+(?:\s+[A-Za-z0-9_./${}<>\-+=:]+)*$")
+OPTION_TABLE_ROW_RE = re.compile(r"^(?P<option>.+?)\s+(?P<required>是|否)\s+(?P<desc>.+)$")
+TABLE_TITLE_START_RE = re.compile(r"^表\d+-\d+\s+\S")
+TABLE_TITLE_INLINE_RE = re.compile(r"表\d+-\d+\s+\S")
+CMAKE_VAR_HEAD_RE = re.compile(r"^(CMAKE_[A-Z0-9_]+)\s+(.*)$")
+LIB_HEAD_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_.+-]*)\s+(.*)$")
+CMAKE_CONTINUATION_WORDS = {
+    "PROPERTIES",
+    "LANGUAGE",
+    "PRIVATE",
+    "PUBLIC",
+    "STATIC",
+    "SHARED",
+    "ASC",
+    "AICPU",
+    "REQUIRED",
+}
 
 
 def load_state():
@@ -208,7 +228,113 @@ def normalize_prose_line(line: str) -> str:
     s = re.sub(r"(\d)\.\s+(\d)", r"\1.\2", s)
     s = re.sub(r"\s+([，。；：！？、）】》])", r"\1", s)
     s = re.sub(r"([（【《])\s+", r"\1", s)
+    # 避免正文里的 "#" 被 markdown 解释成标题
+    if s.startswith("#"):
+        s = "\\" + s
     return s
+
+
+def normalize_option_cell(text: str) -> str:
+    t = squeeze_ws(text)
+    if not t:
+        return t
+    if t.startswith("-"):
+        return t
+    if t.startswith("cce-aicpu-"):
+        return f"--{t}"
+    if "，--" in t:
+        return f"-{t}"
+    if t in {"help", "x", "o", "c", "shared", "lib", "g", "fPIC", "O"}:
+        return f"-{t}"
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*(?:\s+<[^>]+>)?", t):
+        return f"-{t}"
+    return t
+
+
+def escape_table_cell(text: str) -> str:
+    return text.replace("|", r"\|")
+
+
+def is_block_boundary(line: str) -> bool:
+    t = line.strip()
+    return t.startswith("## ") or t.startswith("### ") or bool(TABLE_TITLE_START_RE.match(t))
+
+
+def split_embedded_table_titles(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    in_code = False
+    for line in lines:
+        if line.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            continue
+        if in_code:
+            out.append(line)
+            continue
+        m = TABLE_TITLE_INLINE_RE.search(line)
+        if not m or m.start() == 0:
+            out.append(line)
+            continue
+        prev = line[m.start() - 1]
+        if prev not in "。；:：）】》":
+            out.append(line)
+            continue
+        head = line[:m.start()].rstrip()
+        tail = line[m.start():].strip()
+        if head:
+            out.append(head)
+        if tail:
+            out.append(tail)
+    return out
+
+
+def repair_cmake_var_and_desc(var_name: str, desc: str) -> tuple[str, str]:
+    name = var_name
+    d = squeeze_ws(desc)
+    if name.startswith("CMAKE_BUILD_T"):
+        name = "CMAKE_BUILD_TYPE"
+        d = d.replace("：YPE", "：")
+    elif name.startswith("CMAKE_INSTALL_"):
+        name = "CMAKE_INSTALL_PREFIX"
+    elif name.startswith("CMAKE_CXX_CO"):
+        name = "CMAKE_CXX_COMPILER_LAUNCHER"
+        d = d.replace("程序MPILER_LAUNCH 为", "程序为")
+        d = d.replace("并ER 提高", "并提高")
+    d = d.replace("●", "<br>- ")
+    d = d.replace("：<br>-", "：<br>-")
+    return name, d
+
+
+def repair_lib_name(name: str, desc: str) -> tuple[str, str]:
+    n = name.strip()
+    d = squeeze_ws(desc)
+    special = {
+        "libascendc_runti": "libascendc_runtime.a",
+        "libascend_dump.s": "libascend_dump.so",
+        "liberror_manager.": "liberror_manager.so",
+    }
+    if n in special:
+        fixed = special[n]
+        m = re.search(r"。([A-Za-z0-9_.+-]+)$", d)
+        if m:
+            d = d[: m.start() + 1].strip()
+        return fixed, d
+
+    m = re.search(r"。([A-Za-z0-9_.+-]+)$", d)
+    if m and not re.search(r"\.(?:so|a)$", n):
+        suffix = m.group(1)
+        cand = n + suffix
+        if re.search(r"\.(?:so|a)$", cand):
+            n = cand
+            d = d[: m.start() + 1].strip()
+    return n, d
+
+
+def append_desc_cell(base: str, extra: str) -> str:
+    e = squeeze_ws(extra)
+    if not e:
+        return base
+    return f"{base}<br>{e}" if base else e
 
 
 def join_prose(prev: str, cur: str) -> str:
@@ -229,6 +355,8 @@ def should_start_new_paragraph(prev_text: str, cur_text: str, prev_indent: int, 
 
 def normalize_list_item(line: str) -> str | None:
     t = squeeze_ws(line)
+    if looks_like_cli_option_line(t):
+        return None
     m = STEP_RE.match(t)
     if m:
         num, rest = m.group(1), squeeze_ws(m.group(2))
@@ -250,6 +378,36 @@ def normalize_list_item(line: str) -> str | None:
     return None
 
 
+def looks_like_cli_option_line(line: str) -> bool:
+    t = squeeze_ws(line)
+    if not t:
+        return False
+    compact = t
+    if re.match(r"^--?\s+\S+$", t):
+        compact = re.sub(r"^(-{1,2})\s+", r"\1", t)
+    if " " in compact:
+        return False
+    return bool(CLI_FLAG_LINE_RE.match(compact))
+
+
+def looks_like_code_continuation_line(line: str) -> bool:
+    t = squeeze_ws(line)
+    if not t:
+        return False
+    if re.search(r"[\u4e00-\u9fff]", t):
+        return False
+    if len(t) > 180:
+        return False
+    if not CODE_WORD_SEQ_RE.fullmatch(t):
+        return False
+    if any(sym in t for sym in ("_", ".", "/", "$", "=", "<", ">")):
+        return True
+    tokens = t.split()
+    if any(tok in CMAKE_CONTINUATION_WORDS for tok in tokens):
+        return True
+    return t.isupper()
+
+
 def is_code_like(line: str, prev_is_code: bool) -> bool:
     t = line.strip()
     if not t:
@@ -261,6 +419,10 @@ def is_code_like(line: str, prev_is_code: bool) -> bool:
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", t))
     if t.startswith("${") and has_cjk:
         return False
+    if prev_is_code and looks_like_cli_option_line(t):
+        return True
+    if is_hash_comment_code_line(t, prev_is_code):
+        return True
     if CODE_HEAD_RE.search(t) or SHELL_RE.search(t):
         return True
     if t.startswith("//") or t.startswith("/*") or t.endswith("*/"):
@@ -273,15 +435,47 @@ def is_code_like(line: str, prev_is_code: bool) -> bool:
         return True
     if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*\(.*\)\s*(//.*)?$", t):
         return True
+    if not has_cjk and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*\(.*$", t):
+        return True
     if has_cjk and ";" in t and re.search(r"[A-Za-z_][A-Za-z0-9_:.>]*\s*\(", t):
         return True
-    if any(sym in t for sym in ("{", "}", ";", "::", "->", "<<<", ">>>", "#include", "#define", "├──", "└──", "│")) and not has_cjk:
+    if any(sym in t for sym in ("├──", "└──", "│")):
+        return True
+    if any(sym in t for sym in ("{", "}", ";", "::", "->", "<<<", ">>>", "#include", "#define")) and not has_cjk:
         return True
     if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)", t) and re.search(r"[=<>]", t) and not has_cjk:
+        return True
+    if prev_is_code and looks_like_code_continuation_line(t):
+        return True
+    if prev_is_code and CODE_FILE_RE.search(t):
+        return True
+    if prev_is_code and not has_cjk and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", t):
         return True
     if prev_is_code and re.fullmatch(r"[.·…]{3,}", t):
         return True
     if prev_is_code and (not has_cjk) and re.search(r"[(){}\[\];,<>#=]", t):
+        return True
+    return False
+
+
+def is_hash_comment_code_line(line: str, prev_is_code: bool) -> bool:
+    t = line.strip()
+    if not t.startswith("#"):
+        return False
+    body = squeeze_ws(t.lstrip("#"))
+    if not body:
+        return False
+    if re.search(r"\b(?:bisheng|cmake|make|g\+\+|gcc|python3?|bash|sh)\b", body):
+        return True
+    if body.startswith("-"):
+        return True
+    if CODE_FILE_RE.search(body):
+        return True
+    if re.search(r"\.(?:c|cc|cpp|cxx|h|hpp|asc|aicpu|so|a)(?![A-Za-z0-9_])", body):
+        return True
+    if CLI_OPTION_RE.search(body):
+        return True
+    if prev_is_code:
         return True
     return False
 
@@ -330,6 +524,8 @@ def looks_like_heading(line: str) -> bool:
     t = squeeze_ws(line)
     if not t:
         return False
+    if t.startswith("#"):
+        return False
     if re.fullmatch(r"[.·…]{3,}", t):
         return False
     if normalize_list_item(t) is not None:
@@ -346,7 +542,7 @@ def looks_like_heading(line: str) -> bool:
         return True
     if len(t) <= 14:
         return True
-    if len(t) <= 28 and re.search(r"(实现|流程|定义|调用|参数|设置|概述|介绍|场景|规则|模板|说明|步骤|格式|获取|输出)", t):
+    if len(t) <= 28 and re.search(r"(实现|流程|定义|调用|参数|设置|概述|介绍|场景|规则|模板|说明|步骤|格式|获取|输出|选项|变量|链接库)", t):
         return True
     return False
 
@@ -355,7 +551,9 @@ def is_strong_heading(line: str) -> bool:
     t = squeeze_ws(line)
     if not t or re.search(r"[，。；：！？?,!]", t):
         return False
-    return len(t) <= 36 and bool(re.search(r"(实现|流程|定义|调用|参数|设置|概述|介绍|场景|规则|模板|说明|格式|获取|输出)", t))
+    if t.startswith("#"):
+        return False
+    return len(t) <= 36 and bool(re.search(r"(实现|流程|定义|调用|参数|设置|概述|介绍|场景|规则|模板|说明|格式|获取|输出|选项|变量|链接库)", t))
 
 
 def should_attach_code_comment_continuation(line: str, last_code_line: str) -> bool:
@@ -374,6 +572,22 @@ def should_attach_code_comment_continuation(line: str, last_code_line: str) -> b
     return bool(re.search(r"[\u4e00-\u9fff]", curr))
 
 
+def should_attach_hash_comment_continuation(line: str, last_code_line: str) -> bool:
+    curr = squeeze_ws(line)
+    prev = last_code_line.strip()
+    if not prev.startswith("#"):
+        return False
+    if not curr or normalize_list_item(curr) is not None:
+        return False
+    if curr.startswith(("●", "-", "步骤")):
+        return False
+    if curr.startswith("#"):
+        return False
+    if len(curr) > 120:
+        return False
+    return bool(re.search(r"[\u4e00-\u9fff]", curr))
+
+
 def normalize_code_lines(lines: list[str]) -> list[str]:
     cleaned = [ln.replace("\u00a0", " ").replace("\t", "    ").rstrip() for ln in lines]
     while cleaned and not cleaned[0].strip():
@@ -386,6 +600,273 @@ def normalize_code_lines(lines: list[str]) -> list[str]:
     indents = [len(ln) - len(ln.lstrip(" ")) for ln in cleaned if ln.strip()]
     cut = min(indents) if indents else 0
     return [ln[cut:] if len(ln) >= cut else ln for ln in cleaned]
+
+
+def postprocess_option_table_blocks(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    in_code = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            i += 1
+            continue
+        if in_code or line.strip() != "### 选项 是否 说明":
+            out.append(line)
+            i += 1
+            continue
+
+        j = i + 1
+        while j < len(lines) and lines[j].strip() == "":
+            j += 1
+
+        if j < len(lines) and lines[j].strip() == "必需":
+            j += 1
+            while j < len(lines) and lines[j].strip() == "":
+                j += 1
+
+        body: list[str] = []
+        k = j
+        while k < len(lines):
+            cur = lines[k]
+            if cur.startswith("## ") or cur.startswith("### ") or cur.startswith("```"):
+                break
+            body.append(cur)
+            k += 1
+
+        rows: list[list[str]] = []
+        for raw in body:
+            t = raw.strip()
+            if not t:
+                continue
+            if t.startswith("- "):
+                content = squeeze_ws(t[2:])
+                m = OPTION_TABLE_ROW_RE.match(content)
+                if not m:
+                    continue
+                opt = normalize_option_cell(m.group("option"))
+                req = m.group("required")
+                desc = m.group("desc")
+                rows.append([opt, req, desc])
+            elif rows:
+                rows[-1][2] = f"{rows[-1][2]}<br>{squeeze_ws(t)}"
+
+        if len(rows) < 1:
+            out.append(line)
+            i += 1
+            continue
+
+        out.append("### 选项 是否必需 说明")
+        out.append("")
+        out.append("| 选项 | 是否必需 | 说明 |")
+        out.append("| --- | --- | --- |")
+        for opt, req, desc in rows:
+            out.append(
+                f"| {escape_table_cell(opt)} | {escape_table_cell(req)} | {escape_table_cell(desc)} |"
+            )
+        out.append("")
+        i = k
+
+    return out
+
+
+def postprocess_common_table_blocks(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    in_code = False
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            i += 1
+            continue
+        if in_code:
+            out.append(line)
+            i += 1
+            continue
+
+        head = line.strip()
+        if head == "### 变量 配置说明":
+            block, nxt = parse_var_table_block(lines, i)
+            if block:
+                out.extend(block)
+                i = nxt
+                continue
+        if head == "### 名称 作用描述 使用场景":
+            block, nxt = parse_lib_table_3col_block(lines, i)
+            if block:
+                out.extend(block)
+                i = nxt
+                continue
+        if head == "### 名称 作用描述":
+            block, nxt = parse_lib_table_2col_block(lines, i)
+            if block:
+                out.extend(block)
+                i = nxt
+                continue
+
+        out.append(line)
+        i += 1
+
+    return out
+
+
+def parse_var_table_block(lines: list[str], start: int) -> tuple[list[str] | None, int]:
+    j = start + 1
+    while j < len(lines) and lines[j].strip() == "":
+        j += 1
+
+    rows: list[list[str]] = []
+    k = j
+    while k < len(lines):
+        cur = lines[k]
+        t = cur.strip()
+        if is_block_boundary(cur):
+            break
+
+        if cur.startswith("```"):
+            code_lines: list[str] = []
+            k += 1
+            while k < len(lines) and not lines[k].startswith("```"):
+                code_line = squeeze_ws(lines[k])
+                if code_line:
+                    code_lines.append(f"`{escape_table_cell(code_line)}`")
+                k += 1
+            if k < len(lines) and lines[k].startswith("```"):
+                k += 1
+            if rows and code_lines:
+                rows[-1][1] = append_desc_cell(rows[-1][1], "<br>".join(code_lines))
+            continue
+
+        if not t:
+            k += 1
+            continue
+
+        m = CMAKE_VAR_HEAD_RE.match(t)
+        if m:
+            var_name, desc = repair_cmake_var_and_desc(m.group(1), m.group(2))
+            rows.append([var_name, desc])
+            k += 1
+            continue
+
+        if rows:
+            rows[-1][1] = append_desc_cell(rows[-1][1], t)
+        k += 1
+
+    if not rows:
+        return None, start + 1
+
+    table_lines = [
+        "### 变量 配置说明",
+        "",
+        "| 变量 | 配置说明 |",
+        "| --- | --- |",
+    ]
+    for var_name, desc in rows:
+        table_lines.append(
+            f"| {escape_table_cell(var_name)} | {escape_table_cell(desc)} |"
+        )
+    table_lines.append("")
+    return table_lines, k
+
+
+def parse_lib_table_3col_block(lines: list[str], start: int) -> tuple[list[str] | None, int]:
+    j = start + 1
+    while j < len(lines) and lines[j].strip() == "":
+        j += 1
+
+    rows: list[list[str]] = []
+    k = j
+    while k < len(lines):
+        cur = lines[k]
+        t = cur.strip()
+        if is_block_boundary(cur):
+            break
+        if not t:
+            k += 1
+            continue
+
+        m = LIB_HEAD_RE.match(t)
+        if m and "." in m.group(1):
+            name, rest = repair_lib_name(m.group(1), m.group(2))
+            desc, scene = squeeze_ws(rest), ""
+            if "。" in desc:
+                pos = desc.find("。")
+                scene = squeeze_ws(desc[pos + 1 :])
+                desc = desc[: pos + 1]
+            rows.append([name, desc, scene])
+            k += 1
+            continue
+
+        if rows:
+            if rows[-1][2]:
+                rows[-1][2] = append_desc_cell(rows[-1][2], t)
+            else:
+                rows[-1][2] = squeeze_ws(t)
+        k += 1
+
+    if not rows:
+        return None, start + 1
+
+    table_lines = [
+        "### 名称 作用描述 使用场景",
+        "",
+        "| 名称 | 作用描述 | 使用场景 |",
+        "| --- | --- | --- |",
+    ]
+    for name, desc, scene in rows:
+        table_lines.append(
+            f"| {escape_table_cell(name)} | {escape_table_cell(desc)} | {escape_table_cell(scene)} |"
+        )
+    table_lines.append("")
+    return table_lines, k
+
+
+def parse_lib_table_2col_block(lines: list[str], start: int) -> tuple[list[str] | None, int]:
+    j = start + 1
+    while j < len(lines) and lines[j].strip() == "":
+        j += 1
+
+    rows: list[list[str]] = []
+    k = j
+    while k < len(lines):
+        cur = lines[k]
+        t = cur.strip()
+        if is_block_boundary(cur):
+            break
+        if not t:
+            k += 1
+            continue
+
+        m = LIB_HEAD_RE.match(t)
+        if m and m.group(1).startswith("lib"):
+            name, desc = repair_lib_name(m.group(1), m.group(2))
+            rows.append([name, squeeze_ws(desc)])
+            k += 1
+            continue
+
+        if rows:
+            rows[-1][1] = append_desc_cell(rows[-1][1], t)
+        k += 1
+
+    if not rows:
+        return None, start + 1
+
+    table_lines = [
+        "### 名称 作用描述",
+        "",
+        "| 名称 | 作用描述 |",
+        "| --- | --- |",
+    ]
+    for name, desc in rows:
+        table_lines.append(
+            f"| {escape_table_cell(name)} | {escape_table_cell(desc)} |"
+        )
+    table_lines.append("")
+    return table_lines, k
 
 
 def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
@@ -490,7 +971,10 @@ def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
             blocks.append(list_item)
             prev_raw_blank = False
             continue
-        if code_buf and should_attach_code_comment_continuation(stripped, code_buf[-1]):
+        if code_buf and (
+            should_attach_code_comment_continuation(stripped, code_buf[-1])
+            or should_attach_hash_comment_continuation(stripped, code_buf[-1])
+        ):
             code_buf.append(raw)
             prev_raw_blank = False
             continue
@@ -517,7 +1001,17 @@ def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
             continue
         compact.append(line)
 
-    return "\n".join(compact) + "\n"
+    compact = split_embedded_table_titles(compact)
+    compact = postprocess_option_table_blocks(compact)
+    compact = postprocess_common_table_blocks(compact)
+
+    final_compact: list[str] = []
+    for line in compact:
+        if line == "" and final_compact and final_compact[-1] == "":
+            continue
+        final_compact.append(line)
+
+    return "\n".join(final_compact) + "\n"
 
 def export_sections_to_markdown(pdf_path: Path, out_dir: Path):
     """
