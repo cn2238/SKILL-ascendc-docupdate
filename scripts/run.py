@@ -43,6 +43,9 @@ TABLE_TITLE_START_RE = re.compile(r"^表\d+-\d+\s+\S")
 TABLE_TITLE_INLINE_RE = re.compile(r"表\d+-\d+\s+\S")
 CMAKE_VAR_HEAD_RE = re.compile(r"^(CMAKE_[A-Z0-9_]+)\s+(.*)$")
 LIB_HEAD_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_.+-]*)\s+(.*)$")
+PARAM_DESC_LABEL_RE = re.compile(r"(描述|含义|功能|说明)")
+PARAM_TABLE_HEADER_KEY_RE = re.compile(r"^(参数名|参数名称)\b")
+PARAM_ROW_IO_RE = re.compile(r"^(输入/输出|输入输出|输入|输出|入参|出参)$")
 API_TABLE_ROW_START_RE = re.compile(r"^(?:基础API|Utils API|高阶API)\s*>")
 API_TABLE_HEADER_NOISE_RE = re.compile(r"接口分类接口名称(?:备注)?")
 API_NAME_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)?")
@@ -680,6 +683,222 @@ def normalize_code_lines(lines: list[str]) -> list[str]:
     indents = [len(ln) - len(ln.lstrip(" ")) for ln in cleaned if ln.strip()]
     cut = min(indents) if indents else 0
     return [ln[cut:] if len(ln) >= cut else ln for ln in cleaned]
+
+
+def parse_param_table_header(line: str) -> tuple[int, str, str] | None:
+    if not line.startswith("### "):
+        return None
+    head = squeeze_ws(line[4:])
+    if not PARAM_TABLE_HEADER_KEY_RE.search(head):
+        return None
+    desc_matches = list(PARAM_DESC_LABEL_RE.finditer(head))
+    if not desc_matches:
+        return None
+    desc_label = desc_matches[-1].group(1)
+    first_col = "参数名称" if "参数名称" in head else "参数名"
+    has_io = bool(re.search(r"(输入/输出|输入/输|输入/|入/|输出|输\b|输入\b|出\b)", head))
+    return (3 if has_io else 2), first_col, desc_label
+
+
+def is_param_table_header_fragment(line: str) -> bool:
+    t = squeeze_ws(line.lstrip("#").strip())
+    if t in {"入/", "出", "入", "输出", "输入", "输入/", "输入/输出", "输", "输/", "出/"}:
+        return True
+    if line.startswith("### "):
+        h = squeeze_ws(line[4:])
+        if h in {"入/", "出", "入", "输出", "输入", "输入/", "输入/输出", "输", "输/", "出/"}:
+            return True
+    return False
+
+
+def looks_like_param_row_name(token: str) -> bool:
+    t = squeeze_ws(token)
+    if not t:
+        return False
+    if t.startswith(("-", "●", "•", "#")):
+        return False
+    if t.startswith(("针对", "类型为", "支持", "该参数", "此参数", "如果", "注意")):
+        return False
+    if t.startswith("Atlas"):
+        return False
+    if len(t) > 48:
+        return False
+    if re.search(r"[，。；：！？,;:]", t):
+        return False
+    return True
+
+
+def normalize_param_io(io_text: str) -> str:
+    t = squeeze_ws(io_text)
+    if t == "入参":
+        return "输入"
+    if t == "出参":
+        return "输出"
+    if t == "输入输出":
+        return "输入/输出"
+    return t
+
+
+def parse_param_row_2col(line: str) -> list[str] | None:
+    t = squeeze_ws(line)
+    m = re.match(r"^(?P<name>\S+)\s+(?P<desc>.+)$", t)
+    if not m:
+        return None
+    name = m.group("name")
+    if not looks_like_param_row_name(name):
+        return None
+    return [name, squeeze_ws(m.group("desc"))]
+
+
+def parse_param_row_3col(line: str) -> list[str] | None:
+    t = squeeze_ws(line)
+    m = re.match(
+        r"^(?P<name>\S+)\s+(?P<io>输入/输出|输入输出|输入|输出|入参|出参)\s*(?P<desc>.*)$",
+        t,
+    )
+    if not m:
+        return None
+    name = m.group("name")
+    if not looks_like_param_row_name(name):
+        return None
+    io_val = normalize_param_io(m.group("io"))
+    if not PARAM_ROW_IO_RE.match(io_val):
+        return None
+    return [name, io_val, squeeze_ws(m.group("desc"))]
+
+
+def repair_param_row(row: list[str], ncol: int) -> list[str]:
+    if ncol == 2:
+        name, desc = row
+    else:
+        name, io_val, desc = row
+    name = squeeze_ws(name)
+    desc = squeeze_ws(desc)
+
+    if name == "sharedTmpB":
+        name = "sharedTmpBuffer"
+    if name == "maxLiveNo" and "deCount" in desc:
+        name = "maxLiveNodeCount"
+        desc = desc.replace("deCount ", "")
+    if name == "repeatTim" and "迭代次数" in desc:
+        name = "repeatTimes"
+    desc = desc.replace("该方式uffer", "该方式")
+
+    if ncol == 2:
+        return [name, desc]
+    return [name, io_val, desc]
+
+
+def parse_param_table_block(
+    lines: list[str], start: int, header_info: tuple[int, str, str]
+) -> tuple[list[str] | None, int]:
+    ncol, first_col, desc_col = header_info
+    rows: list[list[str]] = []
+    k = start + 1
+
+    while k < len(lines):
+        cur = lines[k]
+        t = cur.strip()
+
+        if cur.startswith("## "):
+            break
+        if TABLE_TITLE_START_RE.match(t):
+            break
+        if cur.startswith("### "):
+            if parse_param_table_header(cur) is not None:
+                k += 1
+                continue
+            if is_param_table_header_fragment(cur):
+                k += 1
+                continue
+            break
+        if not t:
+            k += 1
+            continue
+        if is_param_table_header_fragment(t):
+            k += 1
+            continue
+
+        if cur.startswith("```"):
+            code_lines: list[str] = []
+            k += 1
+            while k < len(lines) and not lines[k].startswith("```"):
+                code_line = squeeze_ws(lines[k])
+                if code_line:
+                    code_lines.append(f"`{escape_table_cell(code_line)}`")
+                k += 1
+            if k < len(lines) and lines[k].startswith("```"):
+                k += 1
+            if rows and code_lines:
+                rows[-1][-1] = append_desc_cell(rows[-1][-1], "<br>".join(code_lines))
+            continue
+
+        row = parse_param_row_3col(t) if ncol == 3 else parse_param_row_2col(t)
+        if row is not None:
+            rows.append(repair_param_row(row, ncol))
+            k += 1
+            continue
+
+        if rows:
+            rows[-1][-1] = append_desc_cell(rows[-1][-1], t)
+        k += 1
+
+    if not rows:
+        return None, start + 1
+
+    if ncol == 2:
+        table_lines = [
+            f"### {first_col} {desc_col}",
+            "",
+            f"| {first_col} | {desc_col} |",
+            "| --- | --- |",
+        ]
+        for name, desc in rows:
+            table_lines.append(
+                f"| {escape_table_cell(name)} | {escape_table_cell(desc)} |"
+            )
+    else:
+        table_lines = [
+            f"### {first_col} 输入/输出 {desc_col}",
+            "",
+            f"| {first_col} | 输入/输出 | {desc_col} |",
+            "| --- | --- | --- |",
+        ]
+        for name, io_val, desc in rows:
+            table_lines.append(
+                f"| {escape_table_cell(name)} | {escape_table_cell(io_val)} | {escape_table_cell(desc)} |"
+            )
+    table_lines.append("")
+    return table_lines, k
+
+
+def postprocess_param_table_blocks(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    in_code = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            i += 1
+            continue
+        if in_code:
+            out.append(line)
+            i += 1
+            continue
+
+        header = parse_param_table_header(line)
+        if header is not None:
+            block, nxt = parse_param_table_block(lines, i, header)
+            if block:
+                out.extend(block)
+                i = nxt
+                continue
+
+        out.append(line)
+        i += 1
+    return out
 
 
 def postprocess_option_table_blocks(lines: list[str]) -> list[str]:
@@ -1484,6 +1703,7 @@ def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
     compact = split_embedded_table_titles(compact)
     compact = postprocess_option_table_blocks(compact)
     compact = postprocess_common_table_blocks(compact)
+    compact = postprocess_param_table_blocks(compact)
 
     final_compact: list[str] = []
     for line in compact:
