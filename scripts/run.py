@@ -49,7 +49,7 @@ CMAKE_VAR_HEAD_RE = re.compile(r"^(CMAKE_[A-Z0-9_]+)\s+(.*)$")
 LIB_HEAD_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_.+-]*)\s+(.*)$")
 PARAM_DESC_LABEL_RE = re.compile(r"(描述|含义|功能|说明)")
 PARAM_TABLE_HEADER_KEY_RE = re.compile(r"^(参数名|参数名称)\b")
-PARAM_ROW_IO_RE = re.compile(r"^(输入/输出|输入输出|输入|输出|入参|出参|输|入|出|入/输出|输/入)$")
+PARAM_ROW_IO_RE = re.compile(r"^(输入/输出|输入输出|输入|输出|入参|出参|输|入|出|入/输出|输/入|无)$")
 API_TABLE_ROW_START_RE = re.compile(r"^(?:基础API|Utils API|高阶API)\s*>")
 API_TABLE_HEADER_NOISE_RE = re.compile(r"接口分类接口名称(?:备注)?")
 API_NAME_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)?")
@@ -775,8 +775,6 @@ def looks_like_param_row_name(token: str) -> bool:
         return False
     if len(t) > 48:
         return False
-    if len(t) <= 3 and re.fullmatch(r"[A-Za-z]+", t):
-        return False
     if t in {"输", "入", "出", "说明"}:
         return False
     if re.search(r"[，。；：！？,;:]", t):
@@ -815,7 +813,7 @@ def parse_param_row_2col(line: str) -> list[str] | None:
 def parse_param_row_3col(line: str) -> list[str] | None:
     t = squeeze_ws(line)
     m = re.match(
-        r"^(?P<name>\S+)\s+(?P<io>输入/输出|输入输出|输入|输出|入参|出参|输|入|出|入/输出|输/入)\s*(?P<desc>.*)$",
+        r"^(?P<name>.+?)\s+(?P<io>输入/输出|输入输出|输入|输出|入参|出参|输|入|出|入/输出|输/入|无)\s*(?P<desc>.*)$",
         t,
     )
     if not m:
@@ -839,6 +837,9 @@ def looks_like_param_continuation_line(line: str, rows: list[list[str]]) -> bool
     if t in {"输", "入", "出", "说明", "入/输出", "输/入"}:
         return True
     if t.startswith(("输", "入", "出")) and len(t) <= 16:
+        return True
+    # OCR 拆词 + 输入输出碎片，例如: "rce 入"
+    if re.fullmatch(r"[A-Za-z]{1,8}\s+(?:输|入|出|入/输出|输/入)", t):
         return True
     # 常见 OCR 拆词碎片：rce、ype 等
     if re.fullmatch(r"[A-Za-z]{1,4}", t):
@@ -892,6 +893,17 @@ def parse_param_table_block(
                 k += 1
                 continue
             if is_param_table_header_fragment(cur):
+                k += 1
+                continue
+            # 某些参数行会被 OCR 误识别成三级标题，需按行内容继续解析
+            heading_payload = squeeze_ws(cur[4:])
+            row = parse_param_row_3col(heading_payload) if ncol == 3 else parse_param_row_2col(heading_payload)
+            if row is not None and not looks_like_param_continuation_line(heading_payload, rows):
+                rows.append(repair_param_row(row, ncol))
+                k += 1
+                continue
+            if rows and looks_like_param_continuation_line(heading_payload, rows):
+                rows[-1][-1] = append_desc_cell(rows[-1][-1], heading_payload)
                 k += 1
                 continue
             break
