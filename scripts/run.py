@@ -265,6 +265,13 @@ def normalize_prose_line(line: str) -> str:
     s = re.sub(r"(\d)\.\s+(\d)", r"\1.\2", s)
     s = re.sub(r"\s+([，。；：！？、）】》])", r"\1", s)
     s = re.sub(r"([（【《])\s+", r"\1", s)
+    # OCR 噪声：范围文本中的 "Num AI处理器最大核数" -> "AI处理器最大核数"
+    s = re.sub(
+        r"\[\s*1\s*,\s*[Nn]um\s*AI处理器最大核数\s*\]",
+        "[1, AI处理器最大核数]",
+        s,
+    )
+    s = re.sub(r"\b[Nn]um\s*AI处理器最大核数\b", "AI处理器最大核数", s)
     # 避免 __inline__/__gm__ 这类标识被 markdown 解析为强调
     s = re.sub(r"(?<!`)__(?P<id>[A-Za-z][A-Za-z0-9_]*)__", r"`__\g<id>__`", s)
     # 避免正文里的 "#" 被 markdown 解释成标题
@@ -910,6 +917,11 @@ def looks_like_param_continuation_line(line: str, rows: list[list[str]]) -> bool
     t = squeeze_ws(line)
     if not t or not rows:
         return False
+    # 明确像“新参数行”时，不能误判为续行（常见于分页后紧跟的新行）
+    if parse_param_row_3col(t) is not None or parse_param_row_3col_relaxed(t) is not None:
+        return False
+    if parse_param_row_2col(t) is not None:
+        return False
     if t in {"输", "入", "出", "说明", "入/输出", "输/入"}:
         return True
     if t.startswith(("输", "入", "出")) and len(t) <= 16:
@@ -943,6 +955,9 @@ def repair_param_row(row: list[str], ncol: int) -> list[str]:
     if name == "repeatTim" and "迭代次数" in desc:
         name = "repeatTimes"
     desc = desc.replace("该方式uffer", "该方式")
+    if name == "enSequentia" and desc.endswith("lWrite"):
+        name = "enSequentialWrite"
+        desc = squeeze_ws(desc[: -len("lWrite")])
 
     if ncol == 2:
         return [name, desc]
@@ -1124,6 +1139,8 @@ def postprocess_broken_param_markdown_tables(lines: list[str]) -> list[str]:
 
         t = line.strip()
         is_bad_header = t in {"| 参数名 | 输入/ | 描述 |", "| 参数名 | 输入/输出 | 描述 |"}
+        if not is_bad_header and t.startswith("| 参数") and ("输入/" in t) and ("描述" in t):
+            is_bad_header = True
         if not is_bad_header:
             out.append(line)
             i += 1
@@ -1153,6 +1170,21 @@ def postprocess_broken_param_markdown_tables(lines: list[str]) -> list[str]:
                 continue
             if cur.startswith("## "):
                 break
+            # 遇到下一张“表x-y ...”标题，必须断开，避免两张表被吞并
+            if TABLE_TITLE_START_RE.match(s):
+                break
+            # 遇到新的参数表头，说明已进入下一张表
+            if parse_param_table_header(cur) is not None or is_param_table_header_fragment(cur):
+                break
+            # 遇到 markdown 表头（参数表/API表/通用表）也应断开
+            if re.fullmatch(r"\|\s*参数名\s*\|\s*输入/输出\s*\|\s*描述\s*\|", s):
+                break
+            if re.fullmatch(r"\|\s*参数名\s*\|\s*描述\s*\|", s):
+                break
+            if re.fullmatch(r"\|\s*[^|]+\s*\|\s*[^|]+\s*\|", s) and k + 1 < len(lines):
+                nxt = lines[k + 1].strip()
+                if nxt.startswith("| ---"):
+                    break
             if cur.startswith("### ") and squeeze_ws(cur[4:]) in {"返回值说明", "约束说明", "调用示例", "函数原型", "功能说明", "参数说明"}:
                 break
             if cur.startswith("### ") and squeeze_ws(cur[4:]) in {"说明", "备注", "注意"}:
@@ -1179,6 +1211,55 @@ def postprocess_broken_param_markdown_tables(lines: list[str]) -> list[str]:
         out.append("")
         i = k
 
+    return out
+
+
+def postprocess_split_embedded_table_titles(lines: list[str]) -> list[str]:
+    """
+    兜底修复：当下一张“表x-y ...参数说明”标题被 OCR 粘进上一张表的某个单元格时，
+    将其从单元格拆出，恢复为独立标题行，避免两张表被合并。
+    """
+    out: list[str] = []
+    in_code = False
+    title_re = re.compile(
+        r"(?P<before>.*?)(?P<title>表\d+-\d+\s*.*?(?:接口参数说明|结构体参数说明|模板参数说明|参数说明))\s*$"
+    )
+
+    for line in lines:
+        if line.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            continue
+        if in_code:
+            out.append(line)
+            continue
+
+        s = line.strip()
+        if not (s.startswith("|") and s.endswith("|")):
+            out.append(line)
+            continue
+
+        cells = [x.strip() for x in s.strip("|").split("|")]
+        split_idx = -1
+        split_before = ""
+        split_title = ""
+        for idx, cell in enumerate(cells):
+            m = title_re.search(cell)
+            if m and m.group("before").strip():
+                split_idx = idx
+                split_before = squeeze_ws(m.group("before"))
+                split_title = squeeze_ws(m.group("title"))
+                break
+        if split_idx < 0:
+            out.append(line)
+            continue
+
+        cells[split_idx] = split_before
+        rebuilt = "| " + " | ".join(escape_table_cell(c) for c in cells) + " |"
+        out.append(rebuilt)
+        out.append("")
+        out.append(split_title)
+        out.append("")
     return out
 
 
@@ -1214,6 +1295,799 @@ def postprocess_broken_api_markdown_tables(lines: list[str]) -> list[str]:
 
         out.append(line)
         i += 1
+    return out
+
+
+def postprocess_promote_paramname_desc_tables(lines: list[str]) -> list[str]:
+    """
+    修复分页导致的三列表降级：
+    | 参数名称 | 说明 |  ->  | 参数名称 | 数据类型 | 说明 |
+    当“说明”列稳定以数据类型开头时，自动提升为三列。
+    """
+    out: list[str] = []
+    i = 0
+    in_code = False
+    dtype_re = re.compile(
+        r"^(?:u?int(?:8|16|32|64)?_t|int|float|double|bool|half|bfloat16_t|size_t|void|char|string)\b",
+        re.IGNORECASE,
+    )
+
+    def clean_pipe_artifact(s: str) -> str:
+        t = squeeze_ws(s.replace(r"\|", " "))
+        t = t.strip("|").strip()
+        return squeeze_ws(t)
+
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            i += 1
+            continue
+        if in_code:
+            out.append(line)
+            i += 1
+            continue
+
+        head = line.strip()
+        if head not in {"| 参数名称 | 说明 |", "| 参数名 | 说明 |"}:
+            out.append(line)
+            i += 1
+            continue
+
+        j = i + 1
+        if j < len(lines) and lines[j].strip().startswith("| ---"):
+            j += 1
+
+        rows: list[list[str]] = []
+        hit = 0
+        while j < len(lines):
+            t = lines[j].strip()
+            if not (t.startswith("|") and t.endswith("|")):
+                break
+            cells = [clean_pipe_artifact(x) for x in t.strip("|").split("|")]
+            if cells and all(re.fullmatch(r":?-{3,}:?", c) for c in cells):
+                j += 1
+                continue
+            if len(cells) < 2:
+                break
+            name = clean_pipe_artifact(cells[0])
+            desc_or_all = clean_pipe_artifact(" ".join(cells[1:]))
+            dtype = ""
+            desc = desc_or_all
+            m = re.match(r"^(?P<dtype>\S+)\s+(?P<desc>.+)$", desc_or_all)
+            if m and dtype_re.match(m.group("dtype")):
+                dtype = m.group("dtype")
+                desc = squeeze_ws(m.group("desc"))
+                hit += 1
+            rows.append([name, dtype, desc])
+            j += 1
+
+        if rows and hit >= 2:
+            left = "参数名称" if "参数名称" in head else "参数名"
+            out.append(f"| {left} | 数据类型 | 说明 |")
+            out.append("| --- | --- | --- |")
+            for n0, d0, s0 in rows:
+                out.append(
+                    f"| {escape_table_cell(n0)} | {escape_table_cell(d0)} | {escape_table_cell(s0)} |"
+                )
+            out.append("")
+            i = j
+            continue
+
+        out.append(line)
+        i += 1
+    return out
+
+
+def postprocess_split_embedded_param_rows(lines: list[str]) -> list[str]:
+    """
+    修复三列表中“说明”单元格误吞后续参数行的问题（常见于分页续表）：
+    | 参数名称 | 数据类型 | 说明 |
+    """
+    out: list[str] = []
+    i = 0
+    in_code = False
+    dtype_re = r"(?:u?int(?:8|16|32|64)?_t|int|float|double|bool|half|bfloat16_t|size_t|void|char|string)"
+    emb_re = re.compile(
+        rf"(?:^|<br>)(?P<name>[A-Za-z][A-Za-z0-9_ ,，]{{0,80}}?)\s*(?:,|，)?\s*(?P<dtype>{dtype_re})\s+"
+    )
+
+    def clean_cell(s: str) -> str:
+        return squeeze_ws(s.replace(r"\|", " ").strip("|").strip())
+
+    def repair_name_dtype_desc(name: str, dtype: str, desc: str) -> tuple[str, str, str]:
+        n = squeeze_ws(name)
+        d = squeeze_ws(dtype)
+        s = squeeze_ws(desc)
+        s = re.sub(
+            r"\[\s*1\s*,\s*[Nn]um\s*AI处理器最大核数\s*\]",
+            "[1, AI处理器最大核数]",
+            s,
+        )
+        s = re.sub(r"\b[Nn]um\s*AI处理器最大核数\b", "AI处理器最大核数", s)
+
+        # 分页断裂导致首列参数列表丢项
+        if n in {"M, N, Ka", "M,N,Ka"} and re.search(r"\bKb\b", s):
+            n = "M, N, Ka, Kb"
+        if n == "baseM" and ("baseN" in s) and ("baseK" in s):
+            n = "baseM, baseN, baseK"
+        if n == "depthA1" and ("depthB1" in s):
+            n = "depthA1, depthB1"
+        if n == "stepM" and ("stepN" in s) and ("stepKa" in s) and ("stepKb" in s):
+            n = "stepM, stepN, stepKa, stepKb"
+        # 参数名尾段误入说明列（如 usedCore + Num）
+        if n == "usedCore" and re.search(r"\busedCoreNum\b", s):
+            n = "usedCoreNum"
+        if n.startswith("singleCor") and ("singleCore" in s):
+            n = "singleCoreM, singleCoreN, singleCoreK"
+            s = s.replace("该参数取值必eM, 须大于0。", "该参数取值必须大于0。")
+            s = s.replace("singleCor singleCoreK", "singleCoreK")
+            s = s.replace("singleCoreM <=eN", "singleCoreM <= N")
+            s = s.replace("singleCoreN <= N。 singleCor注意", "singleCoreN <= N。注意")
+            s = s.replace("singleCor", "singleCore")
+            s = s.replace("singleCoreeM", "singleCoreM")
+            s = s.replace("singleCoreeN", "singleCoreN")
+            s = s.replace("singleCoreeK", "singleCoreK")
+            s = s.replace("singleCoreM <= N, M", "singleCoreM <= M")
+            s = s.replace("singleCore注意", "注意")
+            s = squeeze_ws(s)
+        return n, d, s
+
+    def split_embedded(desc: str) -> tuple[str, list[list[str]]]:
+        d = squeeze_ws(desc).replace("<br>类型<br>", "<br>").replace("<br>类型", "<br>")
+        ms = list(emb_re.finditer(d))
+        if not ms:
+            return desc, []
+        # 必须是“中途出现”内嵌参数，避免误切正常开头
+        if ms[0].start() == 0:
+            return desc, []
+        head = d[: ms[0].start()].strip()
+        if not head:
+            return desc, []
+        extra_rows: list[list[str]] = []
+        for idx, m in enumerate(ms):
+            seg_start = m.end()
+            seg_end = ms[idx + 1].start() if idx + 1 < len(ms) else len(d)
+            seg_desc = squeeze_ws(d[seg_start:seg_end]).strip("<br>").strip()
+            name = squeeze_ws(m.group("name")).strip(",，")
+            dtype = m.group("dtype")
+            if not name or not seg_desc:
+                continue
+            extra_rows.append([name, dtype, seg_desc])
+        if not extra_rows:
+            return desc, []
+        return head, extra_rows
+
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            i += 1
+            continue
+        if in_code:
+            out.append(line)
+            i += 1
+            continue
+
+        head = line.strip()
+        if head not in {"| 参数名称 | 数据类型 | 说明 |", "| 参数名 | 数据类型 | 说明 |"}:
+            out.append(line)
+            i += 1
+            continue
+
+        out.append(line)
+        i += 1
+        if i < len(lines) and lines[i].strip().startswith("| ---"):
+            out.append(lines[i])
+            i += 1
+
+        while i < len(lines):
+            t = lines[i].strip()
+            if not (t.startswith("|") and t.endswith("|")):
+                break
+            cells = [clean_cell(x) for x in t.strip("|").split("|")]
+            if cells and all(re.fullmatch(r":?-{3,}:?", c) for c in cells):
+                out.append(lines[i])
+                i += 1
+                continue
+            if len(cells) < 3:
+                out.append(lines[i])
+                i += 1
+                continue
+            name = cells[0]
+            dtype = cells[1]
+            desc = clean_cell(" ".join(cells[2:]))
+            head_desc, extras = split_embedded(desc)
+            name, dtype, head_desc = repair_name_dtype_desc(name, dtype, head_desc)
+            out.append(
+                f"| {escape_table_cell(name)} | {escape_table_cell(dtype)} | {escape_table_cell(head_desc)} |"
+            )
+            for n0, d0, s0 in extras:
+                n0, d0, s0 = repair_name_dtype_desc(n0, d0, s0)
+                out.append(
+                    f"| {escape_table_cell(n0)} | {escape_table_cell(d0)} | {escape_table_cell(s0)} |"
+                )
+            i += 1
+
+    return out
+
+
+def postprocess_detach_prose_from_param_tables(lines: list[str]) -> list[str]:
+    """
+    修复参数表中误吸收正文的问题：
+    - 把“多数情况下，用户通过调用...”等正文从单元格拆出为表后正文
+    - 修复分页断裂参数名 singleBatc + hM/hN
+    """
+    out: list[str] = []
+    i = 0
+    in_code = False
+    param_headers = {
+        "| 参数名称 | 数据类型 | 说明 |",
+        "| 参数名 | 数据类型 | 说明 |",
+        "| 参数名 | 输入/输出 | 描述 |",
+    }
+    prose_markers = [
+        "多数情况下，用户通过调用",
+        "如果用户自定义",
+        "如果用户通过调用",
+        "请参考如下",
+        "一组合法的",
+    ]
+
+    def clean_cell(s: str) -> str:
+        return squeeze_ws(s.replace(r"\|", " ").strip("|").strip())
+
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            i += 1
+            continue
+        if in_code:
+            out.append(line)
+            i += 1
+            continue
+
+        head = line.strip()
+        if head not in param_headers:
+            out.append(line)
+            i += 1
+            continue
+
+        out.append(line)
+        i += 1
+        if i < len(lines) and lines[i].strip().startswith("| ---"):
+            out.append(lines[i])
+            i += 1
+
+        detached: list[str] = []
+        while i < len(lines):
+            t = lines[i].strip()
+            if not (t.startswith("|") and t.endswith("|")):
+                break
+            cells = [clean_cell(x) for x in t.strip("|").split("|")]
+            if cells and all(re.fullmatch(r":?-{3,}:?", c) for c in cells):
+                out.append(lines[i])
+                i += 1
+                continue
+            if len(cells) < 3:
+                out.append(lines[i])
+                i += 1
+                continue
+
+            name = cells[0]
+            io_or_dtype = cells[1]
+            desc = clean_cell(" ".join(cells[2:]))
+
+            # 修复 singleBatc + hM/hN 断裂
+            if name == "singleBatc":
+                if re.search(r"hM(?:<br>)?$", desc):
+                    name = "singleBatchM"
+                    desc = re.sub(r"hM(?:<br>)?$", "", desc)
+                    desc = squeeze_ws(desc).rstrip("，,")
+                elif re.search(r"hN(?:<br>)?$", desc):
+                    name = "singleBatchN"
+                    desc = re.sub(r"hN(?:<br>)?$", "", desc)
+                    desc = squeeze_ws(desc).rstrip("，,")
+            # 修复“首列尾缀误并到第三列末尾”的分页错位：
+            # shareMod + "...关注。 e" -> shareMode + "...关注。"
+            compact_desc = squeeze_ws(desc.replace("<br>", ""))
+            m_tail = re.match(r"^(?P<body>该参数预留，开发者无需关注。?)(?P<frag>[A-Za-z]{1,4})$", compact_desc)
+            if m_tail and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{1,40}", name):
+                name = name + m_tail.group("frag")
+                desc = m_tail.group("body")
+            if name == "batchN" and desc.endswith("<br>类型"):
+                desc = desc[: -len("<br>类型")].strip()
+
+            # 正文吸收剥离
+            split_at = -1
+            for mk in prose_markers:
+                pos = desc.find(mk)
+                if pos > 0:
+                    split_at = pos
+                    break
+            if split_at > 0:
+                keep = squeeze_ws(desc[:split_at]).rstrip("，,")
+                spill = squeeze_ws(desc[split_at:])
+                if keep:
+                    desc = keep
+                if spill:
+                    detached.extend([x.strip() for x in spill.split("<br>") if x.strip()])
+
+            out.append(
+                f"| {escape_table_cell(name)} | {escape_table_cell(io_or_dtype)} | {escape_table_cell(desc)} |"
+            )
+            i += 1
+
+        if detached:
+            out.append("")
+            out.extend(detached)
+            out.append("")
+
+    return out
+
+
+def postprocess_rebalance_two_col_constraint_rows(lines: list[str]) -> list[str]:
+    """
+    修复两列表中同一行的跨列串位：
+    典型模式：第二列里混入“db这里表示为...”，实际应归第一列。
+    """
+    out: list[str] = []
+    i = 0
+    in_code = False
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            i += 1
+            continue
+        if in_code:
+            out.append(line)
+            i += 1
+            continue
+
+        t = line.strip()
+        if not (t.startswith("|") and t.endswith("|")):
+            out.append(line)
+            i += 1
+            continue
+
+        # 识别两列表头（通过分隔线）
+        if i + 1 < len(lines):
+            sep = lines[i + 1].strip()
+            if sep.startswith("|") and sep.endswith("|"):
+                sep_cells = [squeeze_ws(x) for x in sep.strip("|").split("|")]
+                sep_cells = [x for x in sep_cells if x]
+                if len(sep_cells) == 2 and all(re.fullmatch(r":?-{3,}:?", c) for c in sep_cells):
+                    out.append(line)
+                    out.append(lines[i + 1])
+                    i += 2
+                    while i < len(lines):
+                        row = lines[i].strip()
+                        if not (row.startswith("|") and row.endswith("|")):
+                            break
+                        cells = [squeeze_ws(x.replace(r"\|", " ")) for x in row.strip("|").split("|")]
+                        if len(cells) < 2:
+                            out.append(lines[i])
+                            i += 1
+                            continue
+                        left = squeeze_ws(cells[0])
+                        right = squeeze_ws(" ".join(cells[1:]))
+
+                        # 去掉分页导致的重复表头行（避免变成数据行）
+                        if left == "约束条件" and right == "说明":
+                            i += 1
+                            continue
+
+                        if " db这里表示为" in right:
+                            pre, post = right.split(" db这里表示为", 1)
+                            pre = squeeze_ws(pre)
+                            moved = "db这里表示为" + squeeze_ws(post)
+                            # 如果右列前缀是“depthA1的取值与...”这类句子，
+                            # 且左列末尾出现重复 token（如 depthA1 depthA1），去掉重复。
+                            m = re.match(r"^(?P<tok>[A-Za-z_][A-Za-z0-9_]*)的取值与", pre)
+                            if m:
+                                tok = m.group("tok")
+                                left = re.sub(rf"\b{re.escape(tok)}\s+{re.escape(tok)}$", tok, left)
+                            else:
+                                # 右列被截断成“的取值与...”时，仍尝试消除左列尾部重复 token
+                                left = re.sub(
+                                    r"\b(?P<tok>[A-Za-z_][A-Za-z0-9_]*)\s+(?P=tok)$",
+                                    r"\g<tok>",
+                                    left,
+                                )
+                            left = append_desc_cell(left, moved)
+                            right = pre
+
+                        # 修复首尾 token 互换：左列尾部误带 A/B/C/Bias，右列前缀缺失
+                        m_swap = re.match(r"^(?P<prefix>.*\s)(?P<tag>A|B|C|Bias)$", left)
+                        if m_swap and (
+                            right.startswith(("矩阵", "的", "base块"))
+                            or right.startswith(("矩阵base块", "的base块"))
+                        ):
+                            tag = m_swap.group("tag")
+                            left = squeeze_ws(m_swap.group("prefix"))
+                            # 防止重复添加
+                            if not right.startswith(tag):
+                                right = f"{tag}{right}"
+
+                        # 修复“右列前缀变量丢失”：`的取值与...` -> `depthA1的取值与...`
+                        if right.startswith("的") and ("取值与" in right):
+                            m_var = re.search(r"=\s*(?P<v>[A-Za-z_][A-Za-z0-9_]*)", left)
+                            if m_var:
+                                v = m_var.group("v")
+                                if not right.startswith(v):
+                                    right = f"{v}{right}"
+
+                        # 修复 l0*_size 与 “其中l0c_type...” 误入第二列：
+                        # 左列应为：... < l0x_size，其中...
+                        # 右列应为：X矩阵base块不超过l0x buffer大小
+                        m_l0 = re.match(
+                            r"^(?P<tag>[ABC])矩阵base块不超过(?P<l0>l0[abc])\s+(?P<mid>.+?)\s+buffer大小(?P<tail>.*)$",
+                            right,
+                        )
+                        if m_l0 and "<" in left:
+                            moved = squeeze_ws(m_l0.group("mid"))
+                            if moved:
+                                # 去掉左列末尾误残留的单字母标签（如 "< C"）
+                                left = re.sub(r"\s<[ ]*[ABC]$", " <", left)
+                                left = re.sub(r"\s+[ABC]$", "", left)
+                                if left.rstrip().endswith("<"):
+                                    left = left.rstrip() + " " + moved
+                                else:
+                                    left = append_desc_cell(left, moved)
+                            right = f"{m_l0.group('tag')}矩阵base块不超过{m_l0.group('l0')} buffer大小"
+                            tail = squeeze_ws(m_l0.group("tail"))
+                            if tail:
+                                if tail in {"类型。", "类型"}:
+                                    left = append_desc_cell(left, tail)
+                                else:
+                                    right = append_desc_cell(right, tail)
+
+                        # 修复“约束条件行内混杂”：第一列后续内容被第二列吸收
+                        if "AL1Size" in left and ("BL1Size" in right or "L1 buffer大小限制" in right):
+                            # 1) 把 "阵在L1上的缓存块大小BL1Size必须满足：" 回填左列
+                            m_bl = re.search(r"阵在L1上的缓存块大小BL1Size必须满足：", right)
+                            if m_bl:
+                                moved = m_bl.group(0)
+                                left = append_desc_cell(left, moved)
+                                right = squeeze_ws(right[m_bl.end() :])
+                            # 2) 把无/有bias公式段与“其中...计算方式如下”回填左列
+                            split_pos = -1
+                            for mk in ("●无bias场景", "- 无bias场景", "其中，AL1Size、BL1Size的计算方式如下："):
+                                pos = right.find(mk)
+                                if pos >= 0 and (split_pos < 0 or pos < split_pos):
+                                    split_pos = pos
+                            if split_pos >= 0:
+                                moved = squeeze_ws(right[split_pos:])
+                                right = squeeze_ws(right[:split_pos]).rstrip("；;,")
+                                if moved:
+                                    left = append_desc_cell(left, moved)
+
+                        # 修复 baseN 对齐描述误入第二列
+                        if left.rstrip().endswith("baseM *") and "baseN按照NZ格式的分形对齐" in right:
+                            left = squeeze_ws(left + " baseN按照NZ格式的分形对齐")
+                            right = right.replace("baseN按照NZ格式的分形对齐", "", 1)
+                            right = right.replace("的base 块", "的base块")
+                            right = squeeze_ws(right)
+
+                        # 修复 MDL 补充约束行左右列互吸收（kaStepIter_/kbStepIter_）
+                        if (
+                            "kaStepIter_" in left
+                            and "% kbStepIter_" in left
+                            and "MDL模板K方向循环搬运要求" in right
+                        ):
+                            right_clean = squeeze_ws(right)
+                            # 取出可能落入右列的两个公式定义
+                            m_ka = re.search(r"kaStepIter_\s*=\s*CeilDiv\([^)]*\)", right_clean)
+                            m_kb = re.search(r"kbStepIter_\s*=\s*CeilDiv\([^)]*\)", right_clean)
+
+                            left_parts = [left]
+                            if "% kaStepIter_ = 0" in right_clean:
+                                left_parts.append("或者kbStepIter_ % kaStepIter_ = 0")
+                            if m_ka:
+                                left_parts.append(squeeze_ws(m_ka.group(0)))
+                            if m_kb:
+                                left_parts.append(squeeze_ws(m_kb.group(0)))
+                            left = "<br>".join(dict.fromkeys([x for x in left_parts if x]))
+
+                            right_parts = [
+                                "MDL模板K方向循环搬运要求Ka和Kb方向迭代次数为倍数关系",
+                                "kaStepIter_：Ka方向循环搬运迭代次数",
+                                "kbStepIter_：Kb方向循环搬运迭代次数",
+                            ]
+                            right = "<br>".join(right_parts)
+
+                        # 修复首列吸收次列：`K方向非全载时，M/N方向只能=1` 应在右列
+                        # 典型：左列 "... stepM K方向非全载时，M方向只能= 1" 右列仅"逐块搬运"
+                        m_absorb = re.search(r"(K方向非全载时，[MN]方向只能=\s*1)\s*$", left)
+                        if m_absorb and right.replace("。", "") in {"逐块搬运"}:
+                            moved = squeeze_ws(m_absorb.group(1))
+                            left = squeeze_ws(left[: m_absorb.start()]).rstrip("，,")
+                            # 回补左列被吞掉的 "= 1"
+                            if re.search(r"stepM\s*$", left):
+                                left = left + " = 1"
+                            elif re.search(r"stepN\s*$", left):
+                                left = left + " = 1"
+                            moved = re.sub(r"=\s*1", "", moved)
+                            right = squeeze_ws(f"{moved}{right}")
+
+                        # 修复“本应两行两列却被并成一行”的约束条件场景
+                        # 典型：左列同时出现“AL1Size/BL1Size约束”和
+                        # “baseM * baseK, baseK * baseN...”两段内容。
+                        if (
+                            "baseM * baseK, baseK * baseN" in left
+                            and "按照NZ格式的分形对齐" in left
+                            and "AL1Size" in left
+                        ):
+                            p2 = left.find("baseM * baseK, baseK * baseN")
+                            left1 = squeeze_ws(left[:p2]).rstrip("，,")
+                            left2 = squeeze_ws(left[p2:])
+                            right1 = right
+                            right2 = ""
+
+                            m_right1 = re.search(r"(A矩阵、B矩阵和Bias.+)$", left1)
+                            if m_right1:
+                                right1 = squeeze_ws(m_right1.group(1))
+                                left1 = squeeze_ws(left1[: m_right1.start()]).rstrip("，,")
+
+                            m_right2 = re.search(r"(A矩阵、B矩阵、C矩阵.+)$", left2)
+                            if m_right2:
+                                right2 = squeeze_ws(m_right2.group(1))
+                                left2 = squeeze_ws(left2[: m_right2.start()]).rstrip("，,")
+
+                            if left1 and right1:
+                                out.append(f"| {escape_table_cell(left1)} | {escape_table_cell(right1)} |")
+                            if left2 and right2:
+                                out.append(f"| {escape_table_cell(left2)} | {escape_table_cell(right2)} |")
+                            elif left2:
+                                out.append(f"| {escape_table_cell(left2)} | {escape_table_cell(right)} |")
+                            i += 1
+                            continue
+
+                        out.append(f"| {escape_table_cell(left)} | {escape_table_cell(right)} |")
+                        i += 1
+                    continue
+
+        out.append(line)
+        i += 1
+
+    return out
+
+
+def postprocess_recover_constraint_table_continuations(lines: list[str]) -> list[str]:
+    """
+    修复“约束条件”两列表分页续行掉出表格的问题：
+    - 将 `| - | 转置场景： |` 以及其后续公式/列表并回前一行左单元格
+    - 将“左右列粘在同一行”的文本尽量拆回两列新行
+    """
+    out: list[str] = []
+    i = 0
+    in_code = False
+
+    def is_boundary(s: str) -> bool:
+        t = s.strip()
+        return (
+            (not t)
+            or t.startswith("## ")
+            or t.startswith("### ")
+            or bool(TABLE_TITLE_START_RE.match(t))
+        )
+
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            i += 1
+            continue
+        if in_code:
+            out.append(line)
+            i += 1
+            continue
+
+        t = line.strip()
+        if not TABLE_TITLE_START_RE.match(t) or ("约束条件" not in t):
+            out.append(line)
+            i += 1
+            continue
+
+        # 保留标题
+        out.append(line)
+        i += 1
+        # 保留空行
+        while i < len(lines) and not lines[i].strip():
+            out.append(lines[i])
+            i += 1
+        # 需要紧随两列表头
+        if i + 1 >= len(lines):
+            continue
+        h = lines[i].strip()
+        sep = lines[i + 1].strip()
+        if not (h.startswith("|") and h.endswith("|") and sep.startswith("|") and sep.endswith("|")):
+            continue
+        sep_cells = [x.strip() for x in sep.strip("|").split("|") if x.strip()]
+        if not (len(sep_cells) == 2 and all(re.fullmatch(r":?-{3,}:?", c) for c in sep_cells)):
+            continue
+
+        out.append(lines[i])
+        out.append(lines[i + 1])
+        i += 2
+
+        rows: list[list[str]] = []
+        while i < len(lines):
+            r = lines[i].strip()
+            if not (r.startswith("|") and r.endswith("|")):
+                break
+            cells = [squeeze_ws(x.replace(r"\|", " ")) for x in r.strip("|").split("|")]
+            if len(cells) >= 2 and not all(re.fullmatch(r":?-{3,}:?", c) for c in cells[:2]):
+                left = squeeze_ws(cells[0])
+                right = squeeze_ws(" ".join(cells[1:]))
+
+                # 去掉分页导致的重复表头行（避免变成数据行）
+                if left == "约束条件" and right == "说明":
+                    i += 1
+                    continue
+
+                # 与前序重平衡一致：把误吸收到右列的左列后续内容回填
+                if "AL1Size" in left and ("BL1Size" in right or "L1 buffer大小限制" in right):
+                    m_bl = re.search(r"阵在L1上的缓存块大小BL1Size必须满足：", right)
+                    if m_bl:
+                        left = append_desc_cell(left, m_bl.group(0))
+                        right = squeeze_ws(right[m_bl.end() :])
+                    split_pos = -1
+                    for mk in ("●无bias场景", "- 无bias场景", "其中，AL1Size、BL1Size的计算方式如下："):
+                        pos = right.find(mk)
+                        if pos >= 0 and (split_pos < 0 or pos < split_pos):
+                            split_pos = pos
+                    if split_pos >= 0:
+                        moved = squeeze_ws(right[split_pos:])
+                        right = squeeze_ws(right[:split_pos]).rstrip("；;,")
+                        if moved:
+                            left = append_desc_cell(left, moved)
+
+                if left.rstrip().endswith("baseM *") and "baseN按照NZ格式的分形对齐" in right:
+                    left = squeeze_ws(left + " baseN按照NZ格式的分形对齐")
+                    right = right.replace("baseN按照NZ格式的分形对齐", "", 1)
+                    right = right.replace("的base ", "的base")
+                    right = squeeze_ws(right)
+
+                # 修复 MDL 补充约束行左右列互吸收（kaStepIter_/kbStepIter_）
+                if (
+                    "kaStepIter_" in left
+                    and "% kbStepIter_" in left
+                    and "MDL模板K方向循环搬运要求" in right
+                ):
+                    right_clean = squeeze_ws(right)
+                    m_ka = re.search(r"kaStepIter_\s*=\s*CeilDiv\([^)]*\)", right_clean)
+                    m_kb = re.search(r"kbStepIter_\s*=\s*CeilDiv\([^)]*\)", right_clean)
+
+                    left_parts = [left]
+                    if "% kaStepIter_ = 0" in right_clean:
+                        left_parts.append("或者kbStepIter_ % kaStepIter_ = 0")
+                    if m_ka:
+                        left_parts.append(squeeze_ws(m_ka.group(0)))
+                    if m_kb:
+                        left_parts.append(squeeze_ws(m_kb.group(0)))
+                    left = "<br>".join(dict.fromkeys([x for x in left_parts if x]))
+
+                    right = "<br>".join(
+                        [
+                            "MDL模板K方向循环搬运要求Ka和Kb方向迭代次数为倍数关系",
+                            "kaStepIter_：Ka方向循环搬运迭代次数",
+                            "kbStepIter_：Kb方向循环搬运迭代次数",
+                        ]
+                    )
+
+                # 修复首列吸收次列：`K方向非全载时，M/N方向只能=1` 应在右列
+                m_absorb = re.search(r"(K方向非全载时，[MN]方向只能=\s*1)\s*$", left)
+                if m_absorb and right.replace("。", "") in {"逐块搬运"}:
+                    moved = squeeze_ws(m_absorb.group(1))
+                    left = squeeze_ws(left[: m_absorb.start()]).rstrip("，,")
+                    if re.search(r"stepM\s*$", left):
+                        left = left + " = 1"
+                    elif re.search(r"stepN\s*$", left):
+                        left = left + " = 1"
+                    moved = re.sub(r"=\s*1", "", moved)
+                    right = squeeze_ws(f"{moved}{right}")
+
+                rows.append([left, right])
+            i += 1
+
+        # 处理 `| - | ... |` 续行标记
+        k = i
+        if rows and rows[-1][0] == "-" and len(rows) >= 2:
+            marker = rows.pop()
+            rows[-1][0] = append_desc_cell(rows[-1][0], marker[1])
+
+            extra_lines: list[str] = []
+            while k < len(lines):
+                cur = lines[k]
+                s = cur.strip()
+                if is_boundary(s):
+                    break
+                if s.startswith("|") and s.endswith("|"):
+                    break
+                if cur.startswith("```"):
+                    code_lines: list[str] = []
+                    k += 1
+                    while k < len(lines) and not lines[k].startswith("```"):
+                        cs = squeeze_ws(lines[k])
+                        if cs:
+                            code_lines.append(cs)
+                        k += 1
+                    if k < len(lines) and lines[k].startswith("```"):
+                        k += 1
+                    if code_lines:
+                        extra_lines.append("<br>".join(code_lines))
+                    continue
+                if s:
+                    extra_lines.append(s)
+                k += 1
+
+            if extra_lines:
+                merged_text = "<br>".join(extra_lines)
+                # 尝试把“左右列粘连的一行”拆回两列新行
+                m_joined = re.match(
+                    r"^(?P<left>.+?)\s+(?P<right>A矩阵、B矩阵、C矩阵.+?需要满足对齐约束：)$",
+                    merged_text,
+                )
+                if m_joined:
+                    rows.append([squeeze_ws(m_joined.group("left")), squeeze_ws(m_joined.group("right"))])
+                else:
+                    rows[-1][0] = append_desc_cell(rows[-1][0], merged_text)
+            i = k
+
+        # 处理“转置场景/计算方式如下”后续公式掉到表外
+        if rows and any(x in rows[-1][0] for x in {"计算方式如下", "转置场景：", "非转置场景："}):
+            k2 = i
+            extra2: list[str] = []
+            while k2 < len(lines):
+                cur = lines[k2]
+                s = cur.strip()
+                if not s:
+                    k2 += 1
+                    continue
+                if is_boundary(s):
+                    break
+                if s.startswith("|") and s.endswith("|"):
+                    break
+                if cur.startswith("```"):
+                    code_lines: list[str] = []
+                    k2 += 1
+                    while k2 < len(lines) and not lines[k2].startswith("```"):
+                        cs = squeeze_ws(lines[k2])
+                        if cs:
+                            code_lines.append(cs)
+                        k2 += 1
+                    if k2 < len(lines) and lines[k2].startswith("```"):
+                        k2 += 1
+                    if code_lines:
+                        extra2.append("<br>".join(code_lines))
+                    continue
+                if s:
+                    extra2.append(s)
+                k2 += 1
+            if extra2:
+                merged2 = "<br>".join(extra2)
+                m_joined2 = re.match(
+                    r"^(?P<left>.+?)\s+(?P<right>A矩阵、B矩阵、C矩阵.+?需要满足对齐约束：)$",
+                    merged2,
+                )
+                if m_joined2:
+                    rows.append([squeeze_ws(m_joined2.group("left")), squeeze_ws(m_joined2.group("right"))])
+                else:
+                    rows[-1][0] = append_desc_cell(rows[-1][0], merged2)
+                i = k2
+
+        for left, right in rows:
+            out.append(f"| {escape_table_cell(left)} | {escape_table_cell(right)} |")
+        out.append("")
+
     return out
 
 
@@ -1592,8 +2466,20 @@ def postprocess_common_table_blocks(lines: list[str]) -> list[str]:
             continue
 
         head = line.strip()
+        if head == "### 产品支持情况":
+            block, nxt = parse_product_support_overview_block(lines, i)
+            if block:
+                out.extend(block)
+                i = nxt
+                continue
         if head == "### 产品 是否支持":
             block, nxt = parse_product_support_table_block(lines, i)
+            if block:
+                out.extend(block)
+                i = nxt
+                continue
+        if head.startswith("### 产品 "):
+            block, nxt = parse_product_support_heading_block(lines, i)
             if block:
                 out.extend(block)
                 i = nxt
@@ -1869,6 +2755,13 @@ def split_row_cells_by_ncol(line: str, ncol: int) -> list[str]:
         return cells
 
     if ncol == 2:
+        # 公式/英文条件 + 中文说明的两列表，优先在首个中文字符处切分，避免只取首词
+        m_cjk = re.search(r"[\u4e00-\u9fff]", t)
+        if m_cjk and m_cjk.start() >= 4:
+            left = squeeze_ws(t[: m_cjk.start()])
+            right = squeeze_ws(t[m_cjk.start() :])
+            if left and right:
+                return [left, right]
         m_num = TABLE_ROW_TRAIL_NUM_RE.match(t)
         if m_num:
             left = squeeze_ws(m_num.group("left"))
@@ -1930,6 +2823,19 @@ def parse_generic_titled_table_block(lines: list[str], start: int) -> tuple[list
     if head.startswith("### "):
         head = squeeze_ws(head[4:])
     header_cells = split_header_cells(head)
+    # 分页续表常见：表头被拆成“参数名称 说明” + 下一行“数据类型”
+    if len(header_cells) == 2:
+        c0 = header_cells[0].replace(" ", "")
+        c1 = header_cells[1].replace(" ", "")
+        if c0 in {"参数名", "参数名称"} and c1 in {"说明", "描述"}:
+            k_frag = j + 1
+            while k_frag < len(lines) and not lines[k_frag].strip():
+                k_frag += 1
+            if k_frag < len(lines):
+                frag = squeeze_ws(lines[k_frag].strip())
+                if frag in {"数据类型", "类型", "输入/输出"}:
+                    header_cells = [header_cells[0], frag, header_cells[1]]
+                    j = k_frag
 
     # 列头都识别不到时，放弃处理，避免吞掉表后内容
     if len(header_cells) < 2:
@@ -1978,6 +2884,36 @@ def parse_generic_titled_table_block(lines: list[str], start: int) -> tuple[list
 
     if not rows:
         return None, start + 1
+
+    # 兜底：分页导致“数据类型”列表头丢失时，从内容恢复三列结构
+    if (
+        ncol == 2
+        and len(header_cells) == 2
+        and header_cells[0].replace(" ", "") in {"参数名", "参数名称"}
+        and header_cells[1].replace(" ", "") in {"说明", "描述"}
+    ):
+        dtype_re = re.compile(
+            r"^(?:u?int(?:8|16|32|64)?_t|int|float|double|bool|half|bfloat16_t|size_t|void|char|string)\b",
+            re.IGNORECASE,
+        )
+        promoted: list[list[str]] = []
+        hit = 0
+        for r in rows:
+            if len(r) < 2:
+                promoted.append((r + ["", ""])[:3])
+                continue
+            name = squeeze_ws(r[0])
+            cell = squeeze_ws(r[1])
+            m = re.match(r"^(?P<dtype>\S+)\s+(?P<desc>.+)$", cell)
+            if m and dtype_re.match(m.group("dtype")):
+                promoted.append([name, m.group("dtype"), squeeze_ws(m.group("desc"))])
+                hit += 1
+            else:
+                promoted.append([name, "", cell])
+        if hit >= 1:
+            header_cells = [header_cells[0], "数据类型", header_cells[1]]
+            ncol = 3
+            rows = promoted
 
     out = [title, ""]
     out.append("| " + " | ".join(escape_table_cell(x) for x in header_cells) + " |")
@@ -2187,6 +3123,201 @@ def parse_product_support_markdown_table_block(lines: list[str], start: int) -> 
     out = ["| 产品 | 是否支持 |", "| --- | --- |"]
     for prod, flag in rows:
         out.append(f"| {escape_table_cell(prod)} | {escape_table_cell(flag)} |")
+    return out, k
+
+
+def parse_product_support_overview_block(lines: list[str], start: int) -> tuple[list[str] | None, int]:
+    if lines[start].strip() != "### 产品支持情况":
+        return None, start + 1
+
+    k = start + 1
+    while k < len(lines) and not lines[k].strip():
+        k += 1
+    if k < len(lines):
+        lead = lines[k].strip()
+        # 已是规范结构，交给其他解析器
+        if lead == "### 产品 是否支持" or re.fullmatch(r"\|\s*产品\s*\|\s*是否支持\s*\|", lead):
+            return None, start + 1
+    if k < len(lines) and lines[k].startswith("```"):
+        return None, start + 1
+
+    support_char_re = re.compile(r"(?<![A-Za-z0-9_])(√|✓|✔|厂|丁|丅|V|v|Y|y|x|X|×|✗|✘)(?![A-Za-z0-9_])")
+    raw_rows: list[tuple[str, list[str]]] = []
+    header_hints: list[str] = []
+    cur = k
+    while cur < len(lines):
+        s = lines[cur].strip()
+        if not s:
+            cur += 1
+            continue
+        if lines[cur].startswith("## "):
+            break
+        if lines[cur].startswith("### "):
+            # 允许“### 产品支持情况”自身，其他三级标题视作结束
+            if cur == start:
+                cur += 1
+                continue
+            break
+        if TABLE_TITLE_START_RE.match(s):
+            break
+        if s.startswith("|") and s.endswith("|"):
+            break
+
+        if ("产品" in s and "支持" in s) and ("Atlas" not in s):
+            header_hints.append(s)
+            cur += 1
+            continue
+
+        flags: list[str] = []
+        spans: list[tuple[int, int]] = []
+        for m in support_char_re.finditer(s):
+            f = normalize_support_flag(m.group(1))
+            if not f:
+                continue
+            flags.append(f)
+            spans.append((m.start(), m.end()))
+        if not flags:
+            cur += 1
+            continue
+
+        product = s
+        for a, b in reversed(spans):
+            product = product[:a] + " " + product[b:]
+        product = squeeze_ws(product).strip("，。；：")
+        if product:
+            raw_rows.append((product, flags))
+        cur += 1
+
+    if not raw_rows:
+        return None, start + 1
+
+    nflag = max((len(fs) for _, fs in raw_rows), default=0)
+    if nflag <= 0:
+        return None, start + 1
+
+    hint = " ".join(header_hints)
+    headers = ["产品"]
+    if nflag == 1:
+        headers.append("是否支持")
+    elif nflag >= 2 and ("软" in hint and "硬" in hint):
+        headers.extend(["是否支持（软同步原型）", "是否支持（硬同步原型）"])
+        for idx in range(3, nflag + 1):
+            headers.append(f"是否支持（列{idx}）")
+    else:
+        for idx in range(1, nflag + 1):
+            headers.append(f"是否支持（列{idx}）")
+
+    out = ["### 产品支持情况", ""]
+    out.append("| " + " | ".join(headers) + " |")
+    out.append("| " + " | ".join(["---"] * len(headers)) + " |")
+    for prod, flags in raw_rows:
+        cells = [prod] + flags + [""] * max(0, nflag - len(flags))
+        out.append("| " + " | ".join(escape_table_cell(c) for c in cells[: len(headers)]) + " |")
+    out.append("")
+    return out, cur
+
+
+def parse_product_support_heading_block(lines: list[str], start: int) -> tuple[list[str] | None, int]:
+    head = lines[start].strip()
+    if not head.startswith("### 产品 "):
+        return None, start + 1
+
+    support_char_re = re.compile(r"(?<![A-Za-z0-9_])(√|✓|✔|厂|丁|丅|V|v|Y|y|x|X|×|✗|✘)(?![A-Za-z0-9_])")
+
+    def parse_support_row(text: str) -> tuple[str, list[str], str] | None:
+        s = squeeze_ws(text)
+        if not s:
+            return None
+        spans: list[tuple[int, int]] = []
+        flags: list[str] = []
+        for m in support_char_re.finditer(s):
+            f = normalize_support_flag(m.group(1))
+            if not f:
+                continue
+            spans.append((m.start(), m.end()))
+            flags.append(f)
+        if not spans:
+            return None
+        first_a, _ = spans[0]
+        _, last_b = spans[-1]
+        left = squeeze_ws(s[:first_a])
+        tail = squeeze_ws(s[last_b:])
+        suffix_as_prod = bool(re.fullmatch(r"(列?产品|系列产品)?", tail))
+        prod = squeeze_ws((left + " " + tail).strip()) if suffix_as_prod else left
+        prod = squeeze_ws(prod).replace("产品是否支持", "").strip()
+        remark = "" if suffix_as_prod else tail
+        if not prod:
+            return None
+        return prod, flags, remark
+
+    k = start + 1
+    header_hints: list[str] = [head.replace("###", "").strip()]
+    rows: list[tuple[str, list[str], str]] = []
+    in_code = False
+    while k < len(lines):
+        raw = lines[k]
+        s = raw.strip()
+        if raw.startswith("```"):
+            in_code = not in_code
+            k += 1
+            continue
+        if in_code:
+            k += 1
+            continue
+        if not s:
+            k += 1
+            continue
+        if raw.startswith("## "):
+            break
+        if raw.startswith("### "):
+            break
+        if TABLE_TITLE_START_RE.match(s):
+            break
+        if s.startswith("|") and s.endswith("|"):
+            break
+
+        parsed = parse_support_row(s)
+        if parsed:
+            rows.append(parsed)
+        elif ("支持" in s) or ("原型" in s) or ("接口" in s):
+            header_hints.append(s)
+        k += 1
+
+    if not rows:
+        return None, start + 1
+
+    nflag = max((len(fs) for _, fs, _ in rows), default=0)
+    if nflag <= 0:
+        return None, start + 1
+    hint = " ".join(header_hints)
+    has_remark = ("备注" in hint) or any(bool(rm) for _, _, rm in rows)
+
+    cols = ["产品"]
+    if nflag == 1:
+        cols.append("是否支持")
+    elif nflag >= 2 and ("软" in hint and "硬" in hint):
+        cols.extend(["是否支持（软同步原型）", "是否支持（硬同步原型）"])
+        for idx in range(3, nflag + 1):
+            cols.append(f"是否支持（列{idx}）")
+    elif nflag >= 2 and ("栈" in hint and "GM" in hint):
+        cols.extend(["是否支持（栈地址）", "是否支持（GM地址）"])
+        for idx in range(3, nflag + 1):
+            cols.append(f"是否支持（列{idx}）")
+    else:
+        for idx in range(1, nflag + 1):
+            cols.append(f"是否支持（列{idx}）")
+    if has_remark:
+        cols.append("备注")
+
+    out = [head, ""]
+    out.append("| " + " | ".join(cols) + " |")
+    out.append("| " + " | ".join(["---"] * len(cols)) + " |")
+    for prod, flags, remark in rows:
+        cells = [prod] + flags + [""] * max(0, nflag - len(flags))
+        if has_remark:
+            cells.append(remark)
+        out.append("| " + " | ".join(escape_table_cell(c) for c in cells[: len(cols)]) + " |")
+    out.append("")
     return out, k
 
 
@@ -2479,69 +3610,63 @@ def parse_operator_spec_table_block(lines: list[str], start: int) -> tuple[list[
     has_output_key = any(kk == "算子输出" for _, (kk, _) in ordered_items)
 
     if parsed_input_rows:
-        out = [title, "", "| 项目 | 名称/内容 | Shape | Data type | Format |", "| --- | --- | --- | --- | --- |"]
+        def html_escape(text: str) -> str:
+            return (
+                text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+
+        out = [title, "", "<table>", "  <thead>", "    <tr><th>项目</th><th>值</th></tr>", "  </thead>", "  <tbody>"]
         for _, (kk, vv) in ordered_items:
             if kk in {"算子输入", "算子输入输出"}:
                 emit_rows = input_struct_rows if input_struct_rows else parsed_input_rows
-                for ridx, (_, n0, s0, d0, f0) in enumerate(emit_rows):
-                    key_cell = kk if ridx == 0 else ""
+                out.append("    <tr>")
+                out.append(f"      <td>{html_escape(kk)}</td>")
+                out.append("      <td>")
+                out.append("        <table>")
+                out.append("          <thead><tr><th>name</th><th>shape</th><th>data type</th><th>format</th></tr></thead>")
+                out.append("          <tbody>")
+                for _, n0, s0, d0, f0 in emit_rows:
                     out.append(
-                        "| "
-                        + " | ".join(
-                            escape_table_cell(x)
-                            for x in [key_cell, n0, s0, d0, f0]
-                        )
-                        + " |"
+                        "            <tr>"
+                        f"<td>{html_escape(n0)}</td>"
+                        f"<td>{html_escape(s0)}</td>"
+                        f"<td>{html_escape(d0)}</td>"
+                        f"<td>{html_escape(f0)}</td>"
+                        "</tr>"
                     )
+                out.append("          </tbody>")
+                out.append("        </table>")
+                out.append("      </td>")
+                out.append("    </tr>")
                 if leaked_output_rows and not has_output_key:
-                    for ridx, (_, n0, s0, d0, f0) in enumerate(leaked_output_rows):
-                        key_cell = "算子输出" if ridx == 0 else ""
-                        out.append(
-                            "| "
-                            + " | ".join(
-                                escape_table_cell(x)
-                                for x in [key_cell, n0, s0, d0, f0]
-                            )
-                            + " |"
-                        )
+                    leaked_vals = [
+                        f"{n0} {s0} {d0} {f0}" for _, n0, s0, d0, f0 in leaked_output_rows
+                    ]
+                    out.append(
+                        "    <tr>"
+                        f"<td>{html_escape('算子输出')}</td>"
+                        f"<td>{html_escape('<br>'.join(leaked_vals)).replace('&lt;br&gt;', '<br>')}</td>"
+                        "</tr>"
+                    )
                 continue
 
             if kk == "使用的主要接口":
                 segs = [squeeze_ws(x) for x in vv.split("<br>") if squeeze_ws(x)]
-                if not segs:
-                    out.append(f"| {escape_table_cell(kk)} |  |  |  |  |")
-                else:
-                    for sidx, seg in enumerate(segs):
-                        key_cell = kk if sidx == 0 else ""
-                        out.append(
-                            "| "
-                            + " | ".join(
-                                escape_table_cell(x)
-                                for x in [key_cell, seg, "", "", ""]
-                            )
-                            + " |"
-                        )
+                val = "<br>".join(html_escape(x) for x in segs) if segs else ""
+                out.append(f"    <tr><td>{html_escape(kk)}</td><td>{val}</td></tr>")
                 continue
 
             p_out = parse_name_shape_dtype_fmt(vv)
             if p_out:
                 _, n0, s0, d0, f0 = p_out
-                out.append(
-                    "| "
-                    + " | ".join(
-                        escape_table_cell(x) for x in [kk, n0, s0, d0, f0]
-                    )
-                    + " |"
-                )
+                val = f"{n0} {s0} {d0} {f0}"
+                out.append(f"    <tr><td>{html_escape(kk)}</td><td>{html_escape(val)}</td></tr>")
             else:
-                out.append(
-                    "| "
-                    + " | ".join(
-                        escape_table_cell(x) for x in [kk, vv, "", "", ""]
-                    )
-                    + " |"
-                )
-        out.append("")
+                val = html_escape(vv).replace("&lt;br&gt;", "<br>")
+                out.append(f"    <tr><td>{html_escape(kk)}</td><td>{val}</td></tr>")
+        out.extend(["  </tbody>", "</table>", ""])
         return out, k
 
     out = [title, "", "| 项目 | 值 |", "| --- | --- |"]
@@ -3438,9 +4563,15 @@ def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
     compact = split_embedded_table_titles(compact)
     compact = postprocess_option_table_blocks(compact)
     compact = postprocess_common_table_blocks(compact)
+    compact = postprocess_split_embedded_table_titles(compact)
     compact = postprocess_broken_api_markdown_tables(compact)
     compact = postprocess_param_table_blocks(compact)
     compact = postprocess_broken_param_markdown_tables(compact)
+    compact = postprocess_promote_paramname_desc_tables(compact)
+    compact = postprocess_split_embedded_param_rows(compact)
+    compact = postprocess_detach_prose_from_param_tables(compact)
+    compact = postprocess_rebalance_two_col_constraint_rows(compact)
+    compact = postprocess_recover_constraint_table_continuations(compact)
     compact = postprocess_call_example_code_blocks(compact)
     compact = postprocess_code_block_prose_leaks(compact)
     compact = postprocess_merge_comment_prose_between_code_blocks(compact)
@@ -3593,9 +4724,14 @@ def export_sections_to_markdown(pdf_path: Path, out_dir: Path):
             continue
 
         rendered = render_section_markdown(cur_title, section_lines)
-        # 再做一次兜底修复，避免个别章节在前序流程后仍残留坏的 API markdown 表
+        # 再做一次兜底修复，避免个别章节在前序流程后仍残留坏表格
         rendered_lines = rendered.splitlines()
         rendered_lines = postprocess_broken_api_markdown_tables(rendered_lines)
+        rendered_lines = postprocess_promote_paramname_desc_tables(rendered_lines)
+        rendered_lines = postprocess_split_embedded_param_rows(rendered_lines)
+        rendered_lines = postprocess_detach_prose_from_param_tables(rendered_lines)
+        rendered_lines = postprocess_rebalance_two_col_constraint_rows(rendered_lines)
+        rendered_lines = postprocess_recover_constraint_table_continuations(rendered_lines)
         out_path.write_text("\n".join(rendered_lines) + "\n", "utf-8")
 
     doc.close()
