@@ -38,6 +38,10 @@ CODE_FILE_RE = re.compile(r"(?:[A-Za-z0-9_./${}-]+)?\.(?:c|cc|cpp|cxx|h|hpp|asc|
 CLI_OPTION_RE = re.compile(r"(?:^|\s)--?[A-Za-z][A-Za-z0-9_-]*")
 CLI_FLAG_LINE_RE = re.compile(r"^--?[A-Za-z][A-Za-z0-9_]*(?:[=:\-][A-Za-z0-9_./${}-]+)?$")
 CODE_WORD_SEQ_RE = re.compile(r"^[A-Za-z0-9_./${}<>\-+=:]+(?:\s+[A-Za-z0-9_./${}<>\-+=:]+)*$")
+CODE_STRONG_TOKEN_RE = re.compile(
+    r"\b(?:#include|#define|class|struct|template|constexpr|return|if|for|while|switch|"
+    r"int\d*_t|uint\d*_t|int|float|double|void|char|bool|size_t)\b"
+)
 OPTION_TABLE_ROW_RE = re.compile(r"^(?P<option>.+?)\s+(?P<required>是|否)\s+(?P<desc>.+)$")
 TABLE_TITLE_START_RE = re.compile(r"^表\d+-\d+\s+\S")
 TABLE_TITLE_INLINE_RE = re.compile(r"表\d+-\d+\s+\S")
@@ -45,7 +49,7 @@ CMAKE_VAR_HEAD_RE = re.compile(r"^(CMAKE_[A-Z0-9_]+)\s+(.*)$")
 LIB_HEAD_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_.+-]*)\s+(.*)$")
 PARAM_DESC_LABEL_RE = re.compile(r"(描述|含义|功能|说明)")
 PARAM_TABLE_HEADER_KEY_RE = re.compile(r"^(参数名|参数名称)\b")
-PARAM_ROW_IO_RE = re.compile(r"^(输入/输出|输入输出|输入|输出|入参|出参)$")
+PARAM_ROW_IO_RE = re.compile(r"^(输入/输出|输入输出|输入|输出|入参|出参|输|入|出|入/输出|输/入)$")
 API_TABLE_ROW_START_RE = re.compile(r"^(?:基础API|Utils API|高阶API)\s*>")
 API_TABLE_HEADER_NOISE_RE = re.compile(r"接口分类接口名称(?:备注)?")
 API_NAME_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)?")
@@ -444,6 +448,9 @@ def is_code_like(line: str, prev_is_code: bool) -> bool:
     t = line.strip()
     if not t:
         return False
+    # OCR 常见注释残片：位于代码上下文时必须归入代码块
+    if prev_is_code and t in {"/", "*", "/*", "*/", "//"}:
+        return True
     if normalize_list_item(t) is not None:
         return False
     if FIGURE_RE.match(t):
@@ -491,6 +498,51 @@ def is_code_like(line: str, prev_is_code: bool) -> bool:
         return True
     if prev_is_code and (not has_cjk) and re.search(r"[(){}\[\];,<>#=]", t):
         return True
+    return False
+
+
+def looks_like_code_bridge_line(line: str, prev_code_line: str, next_nonempty_line: str | None) -> bool:
+    """
+    代码块桥接行判定：
+    若当前行位于两段代码之间，且与代码风格连续（注释、缩进、符号、关键字等），
+    优先保留在代码块内，避免代码块被意外断开。
+    """
+    t = squeeze_ws(line)
+    if not t:
+        return False
+    if normalize_list_item(t) is not None:
+        return False
+    if looks_like_heading(t) or TABLE_TITLE_START_RE.match(t):
+        return False
+
+    prev = squeeze_ws(prev_code_line)
+
+    # 明确代码符号/关键字/类型
+    if re.search(r"[;{}()\[\]]", t):
+        return True
+    if CODE_STRONG_TOKEN_RE.search(t):
+        return True
+    if t.startswith("//") or t.startswith("/*") or t.endswith("*/"):
+        return True
+
+    # 上一行是代码注释或代码行，当前行像注释续行
+    if prev:
+        if should_attach_code_comment_continuation(t, prev):
+            return True
+        if should_attach_hash_comment_continuation(t, prev):
+            return True
+        if should_attach_inline_comment_continuation(t, prev):
+            return True
+        if prev.endswith(("-", ",", "(", "{", "->", "::")):
+            return True
+
+    # “夹在前后代码之间”时，允许弱代码行继续归入代码块
+    if next_nonempty_line and is_code_like(next_nonempty_line, prev_is_code=True):
+        if re.search(r"[A-Za-z_][A-Za-z0-9_:.<>-]*", t):
+            return True
+        # 常见自然语言短句，但处在代码注释上下文中
+        if prev.startswith("//") and len(t) <= 80:
+            return True
     return False
 
 
@@ -702,11 +754,11 @@ def parse_param_table_header(line: str) -> tuple[int, str, str] | None:
 
 def is_param_table_header_fragment(line: str) -> bool:
     t = squeeze_ws(line.lstrip("#").strip())
-    if t in {"入/", "出", "入", "输出", "输入", "输入/", "输入/输出", "输", "输/", "出/"}:
+    if t in {"入/", "出", "入", "输出", "输入", "输入/", "输入/输出", "入/输出", "输", "输/", "输/入", "出/", "说明"}:
         return True
     if line.startswith("### "):
         h = squeeze_ws(line[4:])
-        if h in {"入/", "出", "入", "输出", "输入", "输入/", "输入/输出", "输", "输/", "出/"}:
+        if h in {"入/", "出", "入", "输出", "输入", "输入/", "输入/输出", "入/输出", "输", "输/", "输/入", "出/", "说明"}:
             return True
     return False
 
@@ -723,6 +775,10 @@ def looks_like_param_row_name(token: str) -> bool:
         return False
     if len(t) > 48:
         return False
+    if len(t) <= 3 and re.fullmatch(r"[A-Za-z]+", t):
+        return False
+    if t in {"输", "入", "出", "说明"}:
+        return False
     if re.search(r"[，。；：！？,;:]", t):
         return False
     return True
@@ -735,6 +791,12 @@ def normalize_param_io(io_text: str) -> str:
     if t == "出参":
         return "输出"
     if t == "输入输出":
+        return "输入/输出"
+    if t in {"输", "入"}:
+        return "输入"
+    if t == "出":
+        return "输出"
+    if t in {"入/输出", "输/入"}:
         return "输入/输出"
     return t
 
@@ -753,7 +815,7 @@ def parse_param_row_2col(line: str) -> list[str] | None:
 def parse_param_row_3col(line: str) -> list[str] | None:
     t = squeeze_ws(line)
     m = re.match(
-        r"^(?P<name>\S+)\s+(?P<io>输入/输出|输入输出|输入|输出|入参|出参)\s*(?P<desc>.*)$",
+        r"^(?P<name>\S+)\s+(?P<io>输入/输出|输入输出|输入|输出|入参|出参|输|入|出|入/输出|输/入)\s*(?P<desc>.*)$",
         t,
     )
     if not m:
@@ -765,6 +827,27 @@ def parse_param_row_3col(line: str) -> list[str] | None:
     if not PARAM_ROW_IO_RE.match(io_val):
         return None
     return [name, io_val, squeeze_ws(m.group("desc"))]
+
+
+def looks_like_param_continuation_line(line: str, rows: list[list[str]]) -> bool:
+    """
+    表格续行判定：该行更像当前单元格补充说明时，禁止划到新列/新行。
+    """
+    t = squeeze_ws(line)
+    if not t or not rows:
+        return False
+    if t in {"输", "入", "出", "说明", "入/输出", "输/入"}:
+        return True
+    if t.startswith(("输", "入", "出")) and len(t) <= 16:
+        return True
+    # 常见 OCR 拆词碎片：rce、ype 等
+    if re.fullmatch(r"[A-Za-z]{1,4}", t):
+        return True
+    last_desc = squeeze_ws(rows[-1][-1]) if rows[-1] else ""
+    if last_desc and not re.search(r"[。.!?；;]$", last_desc):
+        # 上一个单元格语义未结束，本行默认并回上一单元格
+        return True
+    return False
 
 
 def repair_param_row(row: list[str], ncol: int) -> list[str]:
@@ -834,7 +917,7 @@ def parse_param_table_block(
             continue
 
         row = parse_param_row_3col(t) if ncol == 3 else parse_param_row_2col(t)
-        if row is not None:
+        if row is not None and not looks_like_param_continuation_line(t, rows):
             rows.append(repair_param_row(row, ncol))
             k += 1
             continue
@@ -1629,10 +1712,16 @@ def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
             append_blank()
         code_buf = []
 
-    for raw in raw_lines:
+    for idx, raw in enumerate(raw_lines):
         raw = raw.replace("\u00a0", " ").rstrip("\n")
         stripped = raw.strip()
         indent = len(raw) - len(raw.lstrip(" "))
+        next_nonempty: str | None = None
+        for j in range(idx + 1, len(raw_lines)):
+            cand = raw_lines[j].replace("\u00a0", " ").strip()
+            if cand:
+                next_nonempty = cand
+                break
 
         if not stripped:
             if code_buf:
@@ -1655,6 +1744,19 @@ def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
             prev_raw_blank = False
             continue
 
+        # 代码块一旦开始，优先用“代码连续性”判定，避免被列表/标题规则打断
+        if code_buf and (
+            looks_like_code_bridge_line(raw, code_buf[-1], next_nonempty)
+            or is_code_like(raw, prev_is_code=True)
+            or should_attach_code_comment_continuation(stripped, code_buf[-1])
+            or should_attach_hash_comment_continuation(stripped, code_buf[-1])
+            or should_attach_inline_comment_continuation(stripped, code_buf[-1])
+        ):
+            flush_para()
+            code_buf.append(raw)
+            prev_raw_blank = False
+            continue
+
         list_item = normalize_list_item(stripped)
         if (prev_raw_blank or SEC_NO_RE.match(stripped) or is_strong_heading(stripped)) and looks_like_heading(stripped):
             flush_para()
@@ -1669,15 +1771,12 @@ def render_section_markdown(cur_title: str, raw_lines: list[str]) -> str:
             blocks.append(list_item)
             prev_raw_blank = False
             continue
-        if code_buf and (
-            should_attach_code_comment_continuation(stripped, code_buf[-1])
-            or should_attach_hash_comment_continuation(stripped, code_buf[-1])
-            or should_attach_inline_comment_continuation(stripped, code_buf[-1])
-        ):
+        if is_code_like(raw, prev_is_code=bool(code_buf)):
+            flush_para()
             code_buf.append(raw)
             prev_raw_blank = False
             continue
-        if is_code_like(raw, prev_is_code=bool(code_buf)):
+        if code_buf and looks_like_code_bridge_line(raw, code_buf[-1], next_nonempty):
             flush_para()
             code_buf.append(raw)
             prev_raw_blank = False
